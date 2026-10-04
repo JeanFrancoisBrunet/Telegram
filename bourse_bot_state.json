@@ -1,0 +1,34 @@
+{
+  "watchlist": [
+    "Airbus",
+    "Amazon",
+    "Apple",
+    "Bitcoin",
+    "Ethereum",
+    "Eurofins",
+    "Hermès",
+    "LISI",
+    "LVMH",
+    "Microsoft",
+    "NVIDIA",
+    "Pfizer",
+    "Sanofi",
+    "Stryker",
+    "SpaceX",
+    "Tesla",
+    "TotalEnergies",
+    "Veolia"
+  ],
+  "alerts": {
+    "LISI": {
+      "low": 62.0,
+      "high": 70.0
+    }
+  },
+  "_triggered": {
+    "LISI": {
+      "low": true,
+      "high": false
+    }
+  }
+}
