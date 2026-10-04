@@ -462,7 +462,7 @@ async def cmd_quota(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _est_autorise(update):
         await update.message.reply_text("⛔ Accès refusé.")
         return
-    lignes = ["📊 *Quotas Groq* (estimation, terminal + bot)", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+    lignes = ["📊 *Quotas Groq* (Terminal & Bot)", "━━━━━━━━━━━━━━━━━━━━━━━━"]
     for mid, label, *_r in ag.GROQ_MODELS.values():
         lignes.append(f"*{label}*\n"
                       f"  60 s : `{ag._tpm_used(mid)}/{ag._model_tpm(mid)}` tokens\n"
