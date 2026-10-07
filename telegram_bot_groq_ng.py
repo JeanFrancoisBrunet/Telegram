@@ -13,6 +13,8 @@
 #                         (côté terminal, /clear seul efface l'écran ; ici = /clear mem)
 #    /new | /sessions | /resume <n> – Nouvelle session (archive) / liste / reprise
 #    /quota             – Quotas Groq (60 s et 24 h, terminal + bot)
+#    /retry             – Relance ton dernier message (après une erreur ou pour
+#                         une autre réponse ; propre à ce bot, mémorisé en RAM)
 #    /mem               – Affiche la mémoire longue (faits mémorisés)
 #    /skills            – Liste les skills disponibles
 #    /reflect           – Basculer le mode Self-Reflection (On/Off)
@@ -291,6 +293,7 @@ async def cmd_aide(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"/sessions — Sessions archivées\n"
         f"/resume <n> — Reprend une session\n"
         f"/quota — Quotas Groq\n"
+        f"/retry — Relance ton dernier message\n"
         f"/mem — Affiche mémoire longue\n"
         f"/compact — Optimise mémoire lg\n"
         f"/skills — Liste des skills\n"
@@ -594,6 +597,10 @@ async def cmd_load(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await _reply(update, f"📚 *{arg}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n{_trunc(content, 3800)}")
+
+# ------------------------------------------------------------
+# /reflect
+# ------------------------------------------------------------
 async def cmd_reflect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _est_autorise(update):
         await update.message.reply_text("⛔ Accès refusé.")
@@ -737,7 +744,7 @@ TOOLS_AIDE = (
     "`\nremember <fait>` - Mémorise un fait\n"
     "`\nreindex` - Resynchronise les ids\n"
     "`\nweb_search <requête>` - Recherche Internet\n"
-    "`\nweb_fetch <url> [:: sujet]` - Lit une page web\n"
+    "`\nweb_fetch <url> [:: sujet]` - Lit une page web\n     (Wikipédia : titre approchant retrouvé)\n"
     "`\nwrite_skill <nom> :: <md>`\n     - Crée/màj un skill (⚡ sans confirm)\n"
     "`\nadd_theme_keyword <thème> :: <mot>`\n     - Ajoute mot-clé (⚡ sans confirm)\n"
     "`\naudit_autonomy [n]`\n     - Ecritures journalisées\n\n"
@@ -976,8 +983,10 @@ async def handler_document_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 # Anti-rebond : évite le double traitement 
 _en_cours: set[int] = set()
 
-async def handler_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global _exchange_idx, _skills_index
+_last_prompt: str = ""      # dernier message texte traité (pour /retry)
+
+async def handler_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE, override: str | None = None):
+    global _exchange_idx, _skills_index, _last_prompt
 
     if not await _est_autorise(update):
         await update.message.reply_text("⛔ Accès refusé.")
@@ -988,10 +997,11 @@ async def handler_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     _en_cours.add(msg_id)
 
-    user_input = (update.message.text or "").strip()
+    user_input = override if override is not None else (update.message.text or "").strip()
     if not user_input:
         _en_cours.discard(msg_id)
         return
+    _last_prompt = user_input      # mémorisé AVANT le traitement : un tour en erreur reste relançable
 
     # Un autre processus (session terminal) a pu changer le modèle/température
     # entre-temps -- resynchronise avant de traiter ce message. Même logique
@@ -1121,6 +1131,20 @@ async def handler_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _en_cours.discard(msg_id)
 
 # ------------------------------------------------------------
+# /retry  (relance le dernier message texte ; même traitement qu'un message normal)
+# ------------------------------------------------------------
+async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _est_autorise(update):
+        await update.message.reply_text("⛔ Accès refusé.")
+        return
+    if not _last_prompt:
+        await _reply(update, "Rien à relancer : aucun message envoyé depuis le démarrage du bot.")
+        return
+    apercu = _last_prompt[:100] + ("…" if len(_last_prompt) > 100 else "")
+    await _reply(update, f"🔁 _Relance :_ {apercu}")
+    await handler_message(update, ctx, override=_last_prompt)
+
+# ------------------------------------------------------------
 # /scanmails  (déclenchement à la demande de emails_scan.py)
 # ------------------------------------------------------------
 EMAILS_SCAN_SCRIPT = os.path.expanduser(
@@ -1201,6 +1225,7 @@ async def message_demarrage(application) -> None:
             BotCommand("sessions","Liste les sessions archivées"),
             BotCommand("resume",  "Reprend une session archivée"),
             BotCommand("quota",   "Quotas Groq (60 s / 24 h)"),
+            BotCommand("retry",   "Relance ton dernier message"),
         ])
     except Exception as e:
         logger.warning(f"set_my_commands a échoué (non bloquant) : {e}")
@@ -1272,6 +1297,7 @@ def main():
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("resume",   cmd_resume))
     app.add_handler(CommandHandler("quota",    cmd_quota))
+    app.add_handler(CommandHandler("retry",    cmd_retry))
     app.add_handler(CommandHandler("mem",     cmd_mem))
     app.add_handler(CommandHandler("compact", cmd_compact))
     app.add_handler(CommandHandler("skills",  cmd_skills))
