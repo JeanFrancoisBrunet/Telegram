@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ===============================================================================
-#  Bot Telegram – Agent IA Groq  (Raspberry Pi 5 - 16 Go RAM - 256 Go SSD NVMe)
+#  Bot Telegram – Agent IA Groq  (Raspberry Pi 5 - 16 Go RAM - 1 To SSD NVMe)
 #
 #  Commandes disponibles :
 #    /start | /aide     – Message d'accueil & liste des commandes
 #    /status            – Modèle actif, température, tokens max, nb skills
 #    /doctor            – Diagnotic le système
-#    /model             – Affiche les modèles disponibles
-#    /model <n>         – Change de modèle Groq (n = 1..3)
+#    /model             – Affiche les modèles disponibles (boutons)
+#    /model <n>         – Change de modèle Groq (n = 1..3) – à taper en entier
 #    /clear             – Vide l'historique conversation (reset mémoire courte)
 #                         (côté terminal, /clear seul efface l'écran ; ici = /clear mem)
-#    /new | /sessions | /resume <n> – Nouvelle session (archive) / liste / reprise
+#    /new | /sessions   – Nouvelle session (archive) / liste
+#    /resume            – Choisir une session à reprendre (boutons)
+#    /resume <n>        – Reprend la session n – à taper en entier
 #    /quota             – Quotas Groq (60 s et 24 h, terminal + bot)
 #    /retry             – Relance ton dernier message (après une erreur ou pour
 #                         une autre réponse ; propre à ce bot, mémorisé en RAM)
 #    /mem               – Affiche la mémoire longue (faits mémorisés)
 #    /skills            – Liste les skills disponibles
+#    /load              – Choisir un skill à afficher (boutons)
+#    /load <nom ou n°>  – Affiche un skill – à taper en entier
 #    /reflect           – Basculer le mode Self-Reflection (On/Off)
-#    /temp <val>        – Change la qualité du modèle (0.0–1.0)
+#    /temp              – Choisir la qualité du modèle (boutons)
+#    /temp <val>        – Change la qualité du modèle (0.0–1.0) – à taper en entier
 #    /tool <nom> [args] – Exécute un outil (date, calc, shell, read, search,
 #                         mem, remember, write, write_skill, add_theme_keyword,
 #                         audit_autonomy, reindex, forget, net, notify, cron)
@@ -38,6 +43,19 @@
 #                         brouillons, envois auto cadrés). Non bloquant pour le bot,
 #                         timeout de sécurité à 5 min.
 #    <texte libre>      – Dialogue avec l'agent Groq
+#
+#  Ergonomie des menus Telegram :
+#    Telegram ne rend cliquable que le début d'une commande : un clic sur
+#    « /model <n> » enverrait « /model » sans argument. Règles appliquées :
+#      1. Toute commande à argument se lance aussi SEULE et propose alors des
+#         boutons (/model, /resume, /temp, /load).
+#      2. Les formes à taper en entier (ex. `/model 2`, `/scanmails --live`,
+#         `/tool calc 2**10`) sont écrites entre backticks, SUR UNE SEULE LIGNE
+#         (jamais de retour à la ligne à l'intérieur des backticks) : non cliquables, 
+#         un appui les copie dans le presse-papiers.
+#      3. _proteger_exemples() met automatiquement entre backticks tout
+#         « /tool <args> » présent dans un texte dynamique (descriptions
+#         d'outils, résultats d'outils) pour qu'il ne devienne pas cliquable.
 #
 #  Architecture :
 #    Ce bot Telegram est une interface → agent_groq_ng.py, il importe directement les 
@@ -65,6 +83,7 @@ import configparser
 import datetime
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -117,7 +136,8 @@ def charger_config() -> tuple[str, int]:
     chat_id = int(cfg["telegram"]["chat_id"].strip())
 
     # Même réflexe que ~/Projects/Groq_agent/.groq_config : 
-    # ce fichier contient le token du bot, on s'assure qu'il n'est lisible que par le propriétaire —
+    # ce fichier contient le token du bot, 
+    # on s'assure qu'il n'est lisible que par le propriétaire —
     # ne doit jamais bloquer le démarrage.
     try:
         os.chmod(cfg_path, 0o600)
@@ -179,6 +199,28 @@ def _trunc(text: str, maxlen: int = 4000) -> str:
     """Telegram limite les messages à 4096 caractères."""
     return text if len(text) <= maxlen else text[:maxlen - 3] + "…"
 
+# « /tool » suivi d'au moins un argument, jusqu'à la fin de ligne, d'une
+# parenthèse, d'un backtick ou d'un tiret séparateur (« — »).
+_RE_EXEMPLE_TOOL = re.compile(r"/tool\s+[^\s`(][^\n`(]*?(?=\s*(?:[()]|\n|$|\s[—–-]\s))")
+
+def _proteger_exemples(text: str) -> str:
+    """Met entre backticks tout exemple « /tool <args> » situé HORS d'un bloc
+    de code, pour que Telegram ne le rende pas cliquable (un clic enverrait
+    « /tool » seul, sans les arguments). Les backticks existants sont
+    respectés : on ne traite que les segments de parité paire (hors code).
+
+    Sert pour les textes dynamiques (descriptions d'outils venant de
+    ag.TOOLS, résultats d'outils) dont on ne maîtrise pas la mise en forme.
+    Les commandes seules (/aide, /model…) restent cliquables."""
+    parts = text.split("`")
+    for i in range(0, len(parts), 2):          # indices pairs = hors code
+        def _wrap(m):
+            brut = m.group(0)
+            coeur = brut.rstrip()
+            return f"`{coeur}`" + brut[len(coeur):]
+        parts[i] = _RE_EXEMPLE_TOOL.sub(_wrap, parts[i])
+    return "`".join(parts)
+
 def _safe_exc_text(exc: BaseException, maxlen: int = 200) -> str:
     """Version tronquée d'une exception à afficher dans le chat.
 
@@ -198,7 +240,13 @@ async def _reply(update: Update, text: str, reply_markup=None):
     (astérisque, underscore ou backtick non apparié — fréquent avec du
     contenu dynamique : noms d'outils, messages d'exception, texte généré
     par le LLM…), on bascule automatiquement en texte brut plutôt que de
-    planter la commande."""
+    planter la commande.
+
+    ATTENTION : en texte brut (repli), Telegram rend cliquable toute commande
+    « /xxx » — y compris les exemples. D'où l'importance de garder un
+    Markdown valide dans les menus (backticks fermés, sur une seule ligne).
+
+    `update` peut aussi être un CallbackQuery (il possède .message)."""
     try:
         await update.message.reply_text(
             _trunc(text), parse_mode="Markdown", reply_markup=reply_markup
@@ -271,6 +319,9 @@ def _clean_reflect_response(original: str, reflected: str) -> str:
 
 # ------------------------------------------------------------
 # /aide  /start
+#   Deux blocs : les commandes cliquables (lancement direct) et les Cdes
+#   à taper en entier, écrites entre backticks (non cliquables → 
+#   un appui les copie, on les colle puis on complète).
 # ------------------------------------------------------------
 async def cmd_aide(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _est_autorise(update):
@@ -284,28 +335,33 @@ async def cmd_aide(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📡 Modèle  : `{ag.GROQ_MODEL}`\n"
         f"🌡 Qualité : `{ag.TEMPERATURE}`\n"
         f"🔄 Self-Reflection : {reflect}\n\n"
-        f"*Commandes :*\n"
+        f"*Commandes (lancement Auto) :*\n"
         f"/status — État de l'agent\n"
-        f"/model — Liste des modèles\n"
-        f"/model <n> — Chgt modèle (1–3)\n"
+        f"/model — Choisir le modèle\n"
         f"/clear — Vide mémoire courte\n"
         f"/new — Nouvelle session (archive)\n"
         f"/sessions — Sessions archivées\n"
-        f"/resume <n> — Reprend une session\n"
+        f"/resume — Reprendre une session\n"
         f"/quota — Quotas Groq\n"
-        f"/retry — Relance ton dernier message\n"
+        f"/retry — Relance le dernier message\n"
         f"/mem — Affiche mémoire longue\n"
         f"/compact — Optimise mémoire lg\n"
         f"/skills — Liste des skills\n"
-        f"/load <nom ou n°> — Affiche skill\n"
+        f"/load — Afficher un skill\n"
         f"/reflect — On/Off Self-Reflection\n"
-        f"/temp <val> — Qualité (0.0–1.0)\n"
+        f"/temp — Qualité (0.0–1.0)\n"
         f"/tools — Liste des outils\n"
-        f"/tool <nom> — ex: date, calc, shell…\n"
         f"/doctor — Diagnostic système\n"
         f"/scanmails — Scan emails (dry-run)\n"
-        f"/scanmails --live — Scan emails (réel)\n"
         f"/aide — Ce menu\n\n"
+        f"*Toucher ces Cdes = copier :*\n"
+        f"`/model 2`\n"
+        f"`/resume 3`\n"
+        f"`/temp 0.7`\n"
+        f"`/load 4`\n"
+        f"`/tool calc 2**10`\n"
+        f"`/tool shell df -h`\n"
+        f"`/scanmails --live`\n\n"
         f"📷 Envoie une photo\n      (légende = question).\n"
         f"💬 Envoie un texte pour dialoguer\n      avec l'agent."
     )
@@ -417,7 +473,7 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     dest = await asyncio.get_running_loop().run_in_executor(None, ag._session_archive_current)
     ag.clear_history()
     if dest:
-        await _reply(update, f"🆕 *Nouvelle session.* Ancienne conversation archivée : `{dest.name}` (/sessions, /resume N)")
+        await _reply(update, f"🆕 *Nouvelle session.* Ancienne conversation archivée : `{dest.name}` (/sessions, /resume)")
     else:
         await _reply(update, "🆕 *Nouvelle session* (la précédente était vide).")
 
@@ -427,31 +483,26 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     rows = ag._session_list()
     if not rows:
-        await _reply(update, "📭 Aucune session archivée — /new en crée une.")
+        await _reply(update, "📭 Aucune session archivée\n — /new en crée une.")
         return
     lignes = ["🗂 *Sessions archivées :*"]
     for i, f, n, apercu in rows[:10]:
         lignes.append(f"*{i}.* `{f.stem}` — {n} msg — {apercu}")
-    lignes.append("\n/resume N pour reprendre une session.")
+    lignes.append("\n/resume pour choisir une session.")
     await _reply(update, "\n".join(lignes))
 
-async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not await _est_autorise(update):
-        await update.message.reply_text("⛔ Accès refusé.")
-        return
-    if not ctx.args or not ctx.args[0].isdigit():
-        await _reply(update, "Usage : `/resume <N>`  (N visible dans /sessions)")
-        return
-    n = int(ctx.args[0])
+async def _do_resume(target, n: int):
+    """Reprend la session n. `target` = Update ou CallbackQuery (les deux
+    exposent .message, ce qui suffit à _reply)."""
     cible = next((f for i, f, *_ in ag._session_list() if i == n), None)
     if cible is None:
-        await _reply(update, f"❌ Session {n} introuvable (/sessions).")
+        await _reply(target, f"❌ Session {n} introuvable (/sessions).")
         return
     try:
         import json as _json
         data = _json.loads(cible.read_text(encoding="utf-8"))
     except Exception as exc:
-        await _reply(update, f"❌ Archive illisible : {_safe_exc_text(exc)}")
+        await _reply(target, f"❌ Archive illisible : {_safe_exc_text(exc)}")
         return
     ag._session_archive_current()
     ag.save_history(data)
@@ -459,7 +510,30 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cible.unlink()
     except OSError:
         pass
-    await _reply(update, f"▶️ *Session reprise* ({len(data)} messages).")
+    await _reply(target, f"▶️ *Session reprise* ({len(data)} messages).")
+
+async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _est_autorise(update):
+        await update.message.reply_text("⛔ Accès refusé.")
+        return
+
+    # Sans argument : boutons (un clic sur /resume suffit)
+    if not ctx.args:
+        rows = ag._session_list()
+        if not rows:
+            await _reply(update, "📭 Aucune session archivée\n — /new en crée une.")
+            return
+        kb = [[InlineKeyboardButton(f"{i}. {f.stem} — {n} msg",
+                                    callback_data=f"resume:{i}")]
+              for i, f, n, apercu in rows[:10]]
+        await _reply(update, "▶️ *Quelle session reprendre ?*",
+                     reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if not ctx.args[0].isdigit():
+        await _reply(update, "Usage : `/resume 3`  (ou /resume seul pour les boutons)")
+        return
+    await _do_resume(update, int(ctx.args[0]))
 
 async def cmd_quota(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _est_autorise(update):
@@ -562,41 +636,51 @@ async def cmd_skills(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         triggers = ", ".join(s.get("triggers", [])[:3])
         lignes.append(f"*{i}.* `{s['name']}` — {s['description']}\n"
                       f"   ↳ Triggers : _{triggers}_")
+    lignes.append("\n/load pour afficher un skill.")
 
     await _reply(update, "\n".join(lignes))
 
 # ------------------------------------------------------------
 # /load
 # ------------------------------------------------------------
+async def _afficher_skill(target, nom: str):
+    """Affiche le contenu d'un skill. `target` = Update ou CallbackQuery."""
+    content = ag.load_skill_content(nom)
+    if not content:
+        await _reply(target, f"❌ Skill '{nom}' introuvable.")
+        return
+    await _reply(target, f"📚 *{nom}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n{_trunc(content, 3800)}")
+
 async def cmd_load(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _est_autorise(update):
         await update.message.reply_text("⛔ Accès refusé.")
         return
 
     global _skills_index
+    _skills_index = ag.load_skills_index()
+    sorted_index = sorted(_skills_index, key=lambda s: s["name"].lower())
+
+    # Sans argument : boutons (un clic sur /load suffit)
     if not ctx.args:
-        await update.message.reply_text(
-            "Usage : /load <nom>  ou  /load <n°>\n"
-            "Utilise /skills pour voir la liste des noms et numéros."
-        )
+        if not sorted_index:
+            await update.message.reply_text("📚 Aucun skill disponible.")
+            return
+        kb = [[InlineKeyboardButton(f"{i}. {s['name']}", callback_data=f"load:{i}")]
+              for i, s in enumerate(sorted_index, 1)]
+        await _reply(update, "📚 *Quel skill afficher ?*",
+                     reply_markup=InlineKeyboardMarkup(kb))
         return
 
     arg = ctx.args[0]
     if arg.isdigit():
         idx = int(arg) - 1
-        sorted_index = sorted(_skills_index, key=lambda s: s["name"].lower())
         if 0 <= idx < len(sorted_index):
             arg = sorted_index[idx]["name"]
         else:
             await update.message.reply_text(f"❌ Numéro {arg} invalide.")
             return
 
-    content = ag.load_skill_content(arg)
-    if not content:
-        await update.message.reply_text(f"❌ Skill '{arg}' introuvable.")
-        return
-
-    await _reply(update, f"📚 *{arg}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n{_trunc(content, 3800)}")
+    await _afficher_skill(update, arg)
 
 # ------------------------------------------------------------
 # /reflect
@@ -620,11 +704,15 @@ async def cmd_temp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Accès refusé.")
         return
 
+    # Sans argument : boutons de valeurs usuelles
     if not ctx.args:
+        kb = [[InlineKeyboardButton(v, callback_data=f"temp:{v}")
+               for v in ("0.0", "0.3", "0.5", "0.7", "1.0")]]
         await _reply(
             update,
             f"🌡 Qualité actuelle : `{ag.TEMPERATURE}`\n"
-            f"Usage : `/temp 0.7`  (valeur entre 0.0 et 1.0)",
+            f"Choisis une valeur (ou tape `/temp 0.4`) :",
+            reply_markup=InlineKeyboardMarkup(kb),
         )
         return
 
@@ -641,13 +729,11 @@ async def cmd_temp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _reply(update, f"✅ Qualité mise à jour : `{ag.TEMPERATURE}`")
 
 # ------------------------------------------------------------
-# Pont confirmation Génération NG : run_agentic_turn() est bloquant (exécuté
-# via run_in_executor, hors thread asyncio) et appelle confirm_callback(tool,
-# preview) -> bool de façon SYNCHRONE. Ce pont fait attendre ce thread avec un
-# threading.Event pendant qu'on programme l'envoi des boutons inline sur la
-# boucle asyncio via run_coroutine_threadsafe -- même principe que
-# _pending_tool_actions plus bas, mais bidirectionnel et avec timeout (une
-# action jamais confirmée ne doit pas bloquer le thread indéfiniment).
+# Génération NG : run_agentic_turn() est bloquant (exécuté via run_in_executor, hors thread asyncio)
+# et appelle confirm_callback(tool, preview) -> bool de façon SYNCHRONE. 
+# Ce pont fait attendre ce thread avec un threading.Event pendant qu'on programme l'envoi des boutons
+# inline sur la boucle asyncio via run_coroutine_threadsafe -- même principe que _pending_tool_actions plus bas, 
+# mais bidirectionnel et avec timeout (une action jamais confirmée ne doit pas bloquer le thread indéfiniment).
 # ------------------------------------------------------------
 _agentic_pending: dict[str, dict] = {}
 _AGENTIC_CONFIRM_TIMEOUT = 120  # secondes avant annulation automatique
@@ -677,7 +763,7 @@ def _make_agentic_confirm(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, loop):
     return _confirm
 
 # ------------------------------------------------------------
-# Callback boutons inline (/model)
+# Callback boutons inline (/model, /resume, /temp, /load, confirmations)
 # ------------------------------------------------------------
 async def callback_dispatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -692,6 +778,41 @@ async def callback_dispatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("groq_model:"):
         n = data[len("groq_model:"):]
         await _changer_model(query, n)
+        return
+
+    if data.startswith("resume:"):
+        try:
+            n = int(data.split(":", 1)[1])
+        except ValueError:
+            await _safe_edit(query, "❌ Numéro de session invalide.")
+            return
+        await _do_resume(query, n)
+        return
+
+    if data.startswith("temp:"):
+        try:
+            val = float(data.split(":", 1)[1])
+            if not (0.0 <= val <= 1.0):
+                raise ValueError
+        except ValueError:
+            await _safe_edit(query, "❌ Valeur invalide.")
+            return
+        ag.TEMPERATURE = val
+        ag.save_config()
+        await _safe_edit(query, f"✅ Qualité mise à jour : `{ag.TEMPERATURE}`")
+        return
+
+    if data.startswith("load:"):
+        try:
+            idx = int(data.split(":", 1)[1]) - 1
+        except ValueError:
+            await _safe_edit(query, "❌ Numéro de skill invalide.")
+            return
+        sorted_index = sorted(ag.load_skills_index(), key=lambda s: s["name"].lower())
+        if 0 <= idx < len(sorted_index):
+            await _afficher_skill(query, sorted_index[idx]["name"])
+        else:
+            await _safe_edit(query, "❌ Skill introuvable.")
         return
 
     if data.startswith("agentic_confirm:") or data.startswith("agentic_cancel:"):
@@ -722,7 +843,7 @@ async def callback_dispatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             result = await asyncio.get_running_loop().run_in_executor(
                 None, ag.execute_tool, tool_name, tool_args
             )
-            await _reply(query, _trunc(f"🛠 *Outil : {tool_name}*\n\n{result}"))
+            await _reply(query, _proteger_exemples(_trunc(f"🛠 *Outil : {tool_name}*\n\n{result}")))
         except Exception as exc:
             logger.error(f"callback_dispatch (tool_confirm) exception : {exc}", exc_info=True)
             await _reply(query, f"❌ Erreur outil `{tool_name}` : {_safe_exc_text(exc)}")
@@ -732,28 +853,37 @@ async def callback_dispatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ------------------------------------------------------------
 # /tool <nom> [args] 
+#
+#   IMPORTANT (ergonomie) : chaque exemple est UNE ligne = UN bloc de codeccomplet 
+#   « `/tool xxx ...` » (backticks ouvrant ET fermant sur la même ligne, jamais de \n à l'intérieur). 
+#   Ainsi Telegram ne le rend pas cliquable : un appui le copie, on le colle dans la zone de saisie
+#   et on complète l'argument. L'ancienne version plaçait des \n DANS les backticks :
+#   le Markdown était rejeté et _reply() retombait en texte brut, où chaque « /tool ... » devenait cliquable.
 # ------------------------------------------------------------
 TOOLS_AIDE = (
-    "🛠 *Outils disponibles :* /tool\n\n"
-    "`date` - date & heure\n"
-    "`\ncalc <expr>` - `/tool calc 2**10`\n"
-    "`\nshell <cmd>` - `/tool shell df -h`\n"
-    "`\nread <chemin>` - `~/notes.txt`\n"
-    "`\nsearch <mots>` - Recherche\n"
-    "`\nmem` - Affiche mémoire longue\n"
-    "`\nremember <fait>` - Mémorise un fait\n"
-    "`\nreindex` - Resynchronise les ids\n"
-    "`\nweb_search <requête>` - Recherche Internet\n"
-    "`\nweb_fetch <url> [:: sujet]` - Lit une page web\n     (Wikipédia : titre approchant retrouvé)\n"
-    "`\nwrite_skill <nom> :: <md>`\n     - Crée/màj un skill (⚡ sans confirm)\n"
-    "`\nadd_theme_keyword <thème> :: <mot>`\n     - Ajoute mot-clé (⚡ sans confirm)\n"
-    "`\naudit_autonomy [n]`\n     - Ecritures journalisées\n\n"
-    "*Outils avec confirmation :*\n"
-    "`\nwrite <fichier> :: <contenu>`\n     - Écrit dans le workspace.\n"
-    "`\nnet <hôte>`\n     - Test connexion (ping)\n       `/tool net 1.1.1.1`\n"
-    "`\nnotify <message>`\n     - Envoie notification Telegram\n"
-    "`\nforget <id>`\n     - Suppr. un fait `long_mem:N` ou `exchange:N` (id avec `/tool search`)\n"
-    "`\ncron list|add|remove`\n     - Gère les tâches planifiées"
+    "🛠 *Outils disponibles*\n"
+    "_Toucher un exemple pour le copier, coller-le puis complèter._\n\n"
+    "*Sans confirmation :*\n"
+    "`/tool date` — date & heure\n"
+    "`/tool calc 2**10` — calcul\n"
+    "`/tool shell df -h` — commande shell\n"
+    "`/tool read ~/notes.txt` — lit un fichier\n"
+    "`/tool search <mots>` — recherche\n"
+    "`/tool mem` — mémoire longue\n"
+    "`/tool remember <fait>` — mémorise un fait\n"
+    "`/tool reindex` — resynchronise les ids\n"
+    "`/tool web_search <requête>` — recherche Internet\n"
+    "`/tool web_fetch <url> [:: sujet]` — lit une page web (Wikipédia)\n"
+    "`/tool write_skill <nom> :: <md>` — crée/màj un skill ⚡\n"
+    "`/tool add_theme_keyword <thème> :: <mot>` — ajoute un mot-clé ⚡\n"
+    "`/tool audit_autonomy [n]` — écritures journalisées\n\n"
+    "*Avec confirmation (boutons) :*\n"
+    "`/tool write <fichier> :: <contenu>` — écrit dans le workspace\n"
+    "`/tool net 1.1.1.1` — test connexion (ping)\n"
+    "`/tool notify <message>` — notification Telegram\n"
+    "`/tool forget <id>` — supprime un fait (`long_mem:N` ou `exchange:N`, id via `/tool search <mots>`)\n"
+    "`/tool cron list` — gère les tâches planifiées (list, add, remove)\n\n"
+    "⚡ = autonome, encadré par des garde-fous automatiques."
 )
 
 _pending_tool_actions: dict[str, tuple[str, str]] = {}
@@ -794,7 +924,7 @@ async def cmd_tool(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ]]
         await _reply(
             update,
-            f"⚠ *Confirmation requise*\n\n{apercu}",
+            _proteger_exemples(f"⚠ *Confirmation requise*\n\n{apercu}"),
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return
@@ -805,7 +935,7 @@ async def cmd_tool(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         result = await asyncio.get_running_loop().run_in_executor(
             None, ag.execute_tool, tool_name, tool_args
         )
-        await _reply(update, f"🛠 *Outil : {tool_name}*\n\n{result}")
+        await _reply(update, _proteger_exemples(f"🛠 *Outil : {tool_name}*\n\n{result}"))
     except Exception as exc:
         logger.error(f"cmd_tool exception : {exc}", exc_info=True)
         await _reply(update, f"❌ Erreur outil `{tool_name}` : {_safe_exc_text(exc)}")
@@ -821,8 +951,10 @@ async def cmd_tools(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lignes = [f"🛠 *Outils disponibles*", "━━━━━━━━━━━━━━━━━━━━━━━━"]
     for nom, desc in ag.TOOLS.items():
         lignes.append(f"• `{nom}` — {desc}")
-    lignes.append("\nUsage : `/tool <nom> [arguments]`")
-    await _reply(update, "\n".join(lignes))
+    lignes.append("\nUsage (à taper en entier) : `/tool <nom> [arguments]`")
+    # Les descriptions viennent de ag.TOOLS : si elles contiennent des exemples
+    # « /tool xxx », on les met en code pour qu'ils ne soient pas cliquables.
+    await _reply(update, _proteger_exemples("\n".join(lignes)))
 
 # ------------------------------------------------------------
 # /doctor  (diagnostic système, réutilise ag.get_doctor_checks)
@@ -1018,11 +1150,11 @@ async def handler_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE, overri
     try:
         ag._undo_begin_turn()                 # journal /undo (terminal) : on repart d'un tour vierge, rien ne s'accumule
         ag._web_begin_turn(user_input)        # état « web » du tour (liste blanche d'hôtes, contamination)
-        # ── Skill Router ──────────────────────────────────────────────────────
+        # ── Skill Router ──
         skill_name, route_method = ag.route_skill(user_input, _skills_index)
         skill_content = ag.load_skill_content(skill_name) if skill_name else None
 
-        # ── Contexte vectoriel ────────────────────────────────────────────────
+        # ── Contexte vectoriel ──
         vector_ctx = None
         if ag._embed_model is not None:
             results = ag.vector_search(user_input, top_k=3)
@@ -1032,7 +1164,7 @@ async def handler_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE, overri
                 if lines:
                     vector_ctx = "\n".join(lines)
 
-        # ── Context Builder + appel Groq ──────────────────────────────────────
+        # ── Context Builder + appel Groq ──
         history       = ag.load_history()
         system_prompt = ag.build_system_prompt(_skills_index, skill_content, vector_ctx)
 
@@ -1044,7 +1176,7 @@ async def handler_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE, overri
         if action_log:
             await _reply(update, "\n".join(f"_{l}_" for l in action_log))
 
-        # ── Self-Reflection ───────────────────────────────────────────────────
+        # ── Self-Reflection ──
         if ag.REFLECT_MODE and not response.startswith("⚠"):
             await ctx.bot.send_chat_action(chat_id=update.effective_chat.id,
                                            action="typing")
@@ -1054,7 +1186,7 @@ async def handler_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE, overri
             )
             response = _clean_reflect_response(original_response, reflected)
 
-        # ── Détection skill à sauvegarder ─────────────────────────────────────
+        # ── Détection skill à sauvegarder ──
         skill_data = ag.parse_skill_from_response(response)
         if skill_data:
             response = ag.response_without_skill_block(response)
@@ -1103,14 +1235,14 @@ async def handler_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE, overri
                         f"_{skill_data.get('description', '')}_ → `{f.name}`",
                     )
 
-        # ── Envoi de la réponse ───────────────────────────────────────────────
+        # ── Envoi de la réponse ──
         if skill_name:
             method_str = "🔑 mot-clé" if route_method == "keyword" else "🔍 vectoriel"
             await _reply(update, f"_📎 Skill : {skill_name}  ({method_str})_")
 
         await _reply(update, response)
 
-        # ── Mise à jour des mémoires ──────────────────────────────────────────
+        # ── Mise à jour des mémoires ──
         history = ag.append_exchange_to_history(user_input, response)   # écriture atomique — invalide le cache _history_cache dans ag
 
         ag.vectorize_exchange(user_input, response, _exchange_idx)
@@ -1145,7 +1277,9 @@ async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await handler_message(update, ctx, override=_last_prompt)
 
 # ------------------------------------------------------------
-# /scanmails  (déclenchement à la demande de emails_scan.py)
+# /scanmails  (déclenchement de emails_scan.py)
+#   Sans argument → dry-run : sûr, donc cliquable.
+#   `/scanmails --live` reste volontairement à taper en entier (action réelle).
 # ------------------------------------------------------------
 EMAILS_SCAN_SCRIPT = os.path.expanduser(
     "~/Projects/Groq_agent/Scan_emails/emails_scan.py"
@@ -1207,25 +1341,28 @@ async def _attendre_ntp(timeout: int = 60) -> bool:
 async def message_demarrage(application) -> None:
     # Enregistre un menu natif de commandes Telegram 
     # (bouton "Menu" à côté de la zone de saisie). 
+    # Seules les commandes qui fonctionnent SEULES y figurent.
     try:
         await application.bot.set_my_commands([
             BotCommand("aide",    "Affiche l'aide"),
             BotCommand("status",  "État de l'agent"),
-            BotCommand("model",   "Change de modèle Groq"),
-            BotCommand("tool",    "Utilise un outil (date, calc, shell, write, net, notify, cron...)"),
+            BotCommand("model",   "Choisir le modèle Groq"),
+            BotCommand("tool",    "Aide des outils (date, calc, shell, write, net...)"),
             BotCommand("tools",   "Liste les outils disponibles"),
             BotCommand("doctor",  "Diagnostic système"),
             BotCommand("mem",     "Affiche la mémoire longue"),
             BotCommand("compact", "Consolide la mémoire longue"),
             BotCommand("skills",  "Liste les skills"),
+            BotCommand("load",    "Affiche un skill (boutons)"),
             BotCommand("reflect", "Active/désactive l'auto-évaluation"),
-            BotCommand("temp",    "Change la température"),
+            BotCommand("temp",    "Change la température (boutons)"),
             BotCommand("clear",   "Efface la mémoire courte"),
             BotCommand("new",     "Nouvelle session (archive l'ancienne)"),
             BotCommand("sessions","Liste les sessions archivées"),
-            BotCommand("resume",  "Reprend une session archivée"),
+            BotCommand("resume",  "Reprend une session archivée (boutons)"),
             BotCommand("quota",   "Quotas Groq (60 s / 24 h)"),
             BotCommand("retry",   "Relance ton dernier message"),
+            BotCommand("scanmails","Scan emails (dry-run)"),
         ])
     except Exception as e:
         logger.warning(f"set_my_commands a échoué (non bloquant) : {e}")
@@ -1288,25 +1425,25 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start",   cmd_aide))
-    app.add_handler(CommandHandler("aide",    cmd_aide))
-    app.add_handler(CommandHandler("status",  cmd_status))
-    app.add_handler(CommandHandler("model",   cmd_model))
-    app.add_handler(CommandHandler("clear",   cmd_clear))
-    app.add_handler(CommandHandler("new",      cmd_new))
-    app.add_handler(CommandHandler("sessions", cmd_sessions))
-    app.add_handler(CommandHandler("resume",   cmd_resume))
-    app.add_handler(CommandHandler("quota",    cmd_quota))
-    app.add_handler(CommandHandler("retry",    cmd_retry))
-    app.add_handler(CommandHandler("mem",     cmd_mem))
-    app.add_handler(CommandHandler("compact", cmd_compact))
-    app.add_handler(CommandHandler("skills",  cmd_skills))
-    app.add_handler(CommandHandler("load",    cmd_load))
-    app.add_handler(CommandHandler("reflect", cmd_reflect))
-    app.add_handler(CommandHandler("temp",    cmd_temp))
-    app.add_handler(CommandHandler("tool",    cmd_tool))
-    app.add_handler(CommandHandler("tools",   cmd_tools))
-    app.add_handler(CommandHandler("doctor",  cmd_doctor))
+    app.add_handler(CommandHandler("start",     cmd_aide))
+    app.add_handler(CommandHandler("aide",      cmd_aide))
+    app.add_handler(CommandHandler("status",    cmd_status))
+    app.add_handler(CommandHandler("model",     cmd_model))
+    app.add_handler(CommandHandler("clear",     cmd_clear))
+    app.add_handler(CommandHandler("new",       cmd_new))
+    app.add_handler(CommandHandler("sessions",  cmd_sessions))
+    app.add_handler(CommandHandler("resume",    cmd_resume))
+    app.add_handler(CommandHandler("quota",     cmd_quota))
+    app.add_handler(CommandHandler("retry",     cmd_retry))
+    app.add_handler(CommandHandler("mem",       cmd_mem))
+    app.add_handler(CommandHandler("compact",   cmd_compact))
+    app.add_handler(CommandHandler("skills",    cmd_skills))
+    app.add_handler(CommandHandler("load",      cmd_load))
+    app.add_handler(CommandHandler("reflect",   cmd_reflect))
+    app.add_handler(CommandHandler("temp",      cmd_temp))
+    app.add_handler(CommandHandler("tool",      cmd_tool))
+    app.add_handler(CommandHandler("tools",     cmd_tools))
+    app.add_handler(CommandHandler("doctor",    cmd_doctor))
     app.add_handler(CommandHandler("scanmails", cmd_scanmails))
     app.add_handler(CallbackQueryHandler(callback_dispatch))
     app.add_handler(MessageHandler(filters.PHOTO, handler_photo))

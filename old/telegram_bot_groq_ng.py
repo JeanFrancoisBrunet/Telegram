@@ -8,8 +8,13 @@
 #    /status            – Modèle actif, température, tokens max, nb skills
 #    /doctor            – Diagnotic le système
 #    /model             – Affiche les modèles disponibles
-#    /model <n>         – Change de modèle Groq (n = 1..7)
+#    /model <n>         – Change de modèle Groq (n = 1..3)
 #    /clear             – Vide l'historique conversation (reset mémoire courte)
+#                         (côté terminal, /clear seul efface l'écran ; ici = /clear mem)
+#    /new | /sessions | /resume <n> – Nouvelle session (archive) / liste / reprise
+#    /quota             – Quotas Groq (60 s et 24 h, terminal + bot)
+#    /retry             – Relance ton dernier message (après une erreur ou pour
+#                         une autre réponse ; propre à ce bot, mémorisé en RAM)
 #    /mem               – Affiche la mémoire longue (faits mémorisés)
 #    /skills            – Liste les skills disponibles
 #    /reflect           – Basculer le mode Self-Reflection (On/Off)
@@ -24,8 +29,14 @@
 #                         automatiques (dédoublonnage sémantique, score
 #                         qualité, anti-emballement) partagés avec l'auto-save
 #                         de skill déclenché par une réponse de l'agent.
-#    📷 photo/image     – Analyse l'image envoyée (qwen/qwen3.6-27b, vision)
+#    📷 photo/image     – Analyse l'image envoyée (qwen/qwen3.8-27b, vision)
 #                         La légende de la photo sert de question optionnelle
+#    /scanmails [--live] [--since-days N]
+#                       – Lance emails_scan.py (scan/classement Gmail+Outlook).
+#                         Sans --live : dry-run (aucune action réelle).
+#                         Avec --live : actions réelles (déplacement, suppression,
+#                         brouillons, envois auto cadrés). Non bloquant pour le bot,
+#                         timeout de sécurité à 5 min.
 #    <texte libre>      – Dialogue avec l'agent Groq
 #
 #  Architecture :
@@ -46,7 +57,7 @@
 #    token_groq = VOTRE_TOKEN_BOT_GROQ
 #    chat_id    = VOTRE_CHAT_ID
 #
-#  Auteur  : Jean-François BRUNET – JFBConseils – Aout 2026
+#  Auteur  : Jean-François BRUNET – JFBConseils – Octobre 2026
 # ===============================================================================
 
 import asyncio
@@ -105,9 +116,9 @@ def charger_config() -> tuple[str, int]:
     token   = cfg["telegram"]["token_groq"].strip()
     chat_id = int(cfg["telegram"]["chat_id"].strip())
 
-    # Même réflexe que ~/Projects/Groq_agent/.groq_config : ce fichier 
-    # contient le token du bot, on s'assure qu'il n'est lisible que par
-    # le propriétaire — ne doit jamais bloquer le démarrage.
+    # Même réflexe que ~/Projects/Groq_agent/.groq_config : 
+    # ce fichier contient le token du bot, on s'assure qu'il n'est lisible que par le propriétaire —
+    # ne doit jamais bloquer le démarrage.
     try:
         os.chmod(cfg_path, 0o600)
     except OSError:
@@ -276,8 +287,13 @@ async def cmd_aide(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"*Commandes :*\n"
         f"/status — État de l'agent\n"
         f"/model — Liste des modèles\n"
-        f"/model <n> — Chgt modèle (1–7)\n"
+        f"/model <n> — Chgt modèle (1–3)\n"
         f"/clear — Vide mémoire courte\n"
+        f"/new — Nouvelle session (archive)\n"
+        f"/sessions — Sessions archivées\n"
+        f"/resume <n> — Reprend une session\n"
+        f"/quota — Quotas Groq\n"
+        f"/retry — Relance ton dernier message\n"
         f"/mem — Affiche mémoire longue\n"
         f"/compact — Optimise mémoire lg\n"
         f"/skills — Liste des skills\n"
@@ -287,6 +303,8 @@ async def cmd_aide(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"/tools — Liste des outils\n"
         f"/tool <nom> — ex: date, calc, shell…\n"
         f"/doctor — Diagnostic système\n"
+        f"/scanmails — Scan emails (dry-run)\n"
+        f"/scanmails --live — Scan emails (réel)\n"
         f"/aide — Ce menu\n\n"
         f"📷 Envoie une photo\n      (légende = question).\n"
         f"💬 Envoie un texte pour dialoguer\n      avec l'agent."
@@ -354,7 +372,7 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _changer_model(update_or_query, n: str):
     """Change le modèle et répond à l'update ou au query."""
     if n not in ag.GROQ_MODELS:
-        msg = f"❌ Numéro invalide : `{n}` — valeurs 1 à 7."
+        msg = f"❌ Numéro invalide : `{n}` — valeurs 1 à 3."
         if hasattr(update_or_query, "message"):
             await _reply(update_or_query, msg)
         else:
@@ -365,16 +383,7 @@ async def _changer_model(update_or_query, n: str):
     ag.GROQ_MODEL = model_id
     ag.client = None
 
-    COMPOUND_MODELS = {"groq/compound", "groq/compound-mini"}
-    reflect_avert = ""
-    if model_id in COMPOUND_MODELS:
-        if ag.REFLECT_MODE:
-            ag.REFLECT_MODE = False
-            reflect_avert = "\n⚠ _Self-Reflection désactivé automatiquement_"
-    else:
-        if not ag.REFLECT_MODE:
-            ag.REFLECT_MODE = True
-            reflect_avert = "\n✅ _Self-Reflection activé automatiquement_"
+    reflect_avert = ""   # la Self-Reflection n'est plus forcée : elle coûte des tokens (quota 8k/min) — /reflect pour l'activer
 
     ag.save_config()
 
@@ -397,6 +406,72 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ag.clear_history()
     await _reply(update, "🧹 *Mémoire courte effacée.* Nouvelle conversation.")
+
+# ------------------------------------------------------------
+# /new  /sessions  /resume  /quota  (alignés sur le terminal)
+# ------------------------------------------------------------
+async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _est_autorise(update):
+        await update.message.reply_text("⛔ Accès refusé.")
+        return
+    dest = await asyncio.get_running_loop().run_in_executor(None, ag._session_archive_current)
+    ag.clear_history()
+    if dest:
+        await _reply(update, f"🆕 *Nouvelle session.* Ancienne conversation archivée : `{dest.name}` (/sessions, /resume N)")
+    else:
+        await _reply(update, "🆕 *Nouvelle session* (la précédente était vide).")
+
+async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _est_autorise(update):
+        await update.message.reply_text("⛔ Accès refusé.")
+        return
+    rows = ag._session_list()
+    if not rows:
+        await _reply(update, "📭 Aucune session archivée — /new en crée une.")
+        return
+    lignes = ["🗂 *Sessions archivées :*"]
+    for i, f, n, apercu in rows[:10]:
+        lignes.append(f"*{i}.* `{f.stem}` — {n} msg — {apercu}")
+    lignes.append("\n/resume N pour reprendre une session.")
+    await _reply(update, "\n".join(lignes))
+
+async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _est_autorise(update):
+        await update.message.reply_text("⛔ Accès refusé.")
+        return
+    if not ctx.args or not ctx.args[0].isdigit():
+        await _reply(update, "Usage : `/resume <N>`  (N visible dans /sessions)")
+        return
+    n = int(ctx.args[0])
+    cible = next((f for i, f, *_ in ag._session_list() if i == n), None)
+    if cible is None:
+        await _reply(update, f"❌ Session {n} introuvable (/sessions).")
+        return
+    try:
+        import json as _json
+        data = _json.loads(cible.read_text(encoding="utf-8"))
+    except Exception as exc:
+        await _reply(update, f"❌ Archive illisible : {_safe_exc_text(exc)}")
+        return
+    ag._session_archive_current()
+    ag.save_history(data)
+    try:
+        cible.unlink()
+    except OSError:
+        pass
+    await _reply(update, f"▶️ *Session reprise* ({len(data)} messages).")
+
+async def cmd_quota(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _est_autorise(update):
+        await update.message.reply_text("⛔ Accès refusé.")
+        return
+    lignes = ["📊 *Quotas Groq* (Terminal & Bot)", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+    for mid, label, *_r in ag.GROQ_MODELS.values():
+        lignes.append(f"*{label}*\n"
+                      f"  60 s : `{ag._tpm_used(mid)}/{ag._model_tpm(mid)}` tokens\n"
+                      f"  24 h : `{ag._tpd_used(mid)}/{ag._daily_limit(mid)}` tokens · "
+                      f"`{ag._req_used(mid)}/{ag.DAILY_REQUEST_LIMIT}` requêtes")
+    await _reply(update, "\n".join(lignes))
 
 # ------------------------------------------------------------
 # /mem
@@ -479,8 +554,7 @@ async def cmd_skills(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Trié par nom (comme /skills en CLI) : load_skills_index() renvoie l'ordre
     # du système de fichiers (nom de FICHIER), qui peut différer du champ
     # 'name' du frontmatter -- sans ce tri, la numérotation affichée ici ne
-    # correspond pas à celle du terminal, rendant /load <n°> 
-    # ambigu d'une interface à l'autre.
+    # correspond pas à celle du terminal, rendant /load <n°> ambigu d'une interface à l'autre.
     sorted_index = sorted(_skills_index, key=lambda s: s["name"].lower())
 
     lignes = ["📚 *Skills disponibles :*\n"]
@@ -523,6 +597,10 @@ async def cmd_load(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await _reply(update, f"📚 *{arg}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n{_trunc(content, 3800)}")
+
+# ------------------------------------------------------------
+# /reflect
+# ------------------------------------------------------------
 async def cmd_reflect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _est_autorise(update):
         await update.message.reply_text("⛔ Accès refusé.")
@@ -665,6 +743,8 @@ TOOLS_AIDE = (
     "`\nmem` - Affiche mémoire longue\n"
     "`\nremember <fait>` - Mémorise un fait\n"
     "`\nreindex` - Resynchronise les ids\n"
+    "`\nweb_search <requête>` - Recherche Internet\n"
+    "`\nweb_fetch <url> [:: sujet]` - Lit une page web\n     (Wikipédia : titre approchant retrouvé)\n"
     "`\nwrite_skill <nom> :: <md>`\n     - Crée/màj un skill (⚡ sans confirm)\n"
     "`\nadd_theme_keyword <thème> :: <mot>`\n     - Ajoute mot-clé (⚡ sans confirm)\n"
     "`\naudit_autonomy [n]`\n     - Ecritures journalisées\n\n"
@@ -699,6 +779,7 @@ async def cmd_tool(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tool_name = ctx.args[0].lower().strip()
     tool_args = " ".join(ctx.args[1:]).strip() if len(ctx.args) > 1 else ""
 
+    ag._web_begin_turn(tool_args)     # /tool tapé par l'utilisateur : pas de contamination héritée du tour précédent
     if tool_name not in ag.TOOLS:
         liste = ", ".join(f"`{t}`" for t in ag.TOOLS)
         await _reply(update, f"❌ Outil inconnu : `{tool_name}`\nOutils disponibles : {liste}")
@@ -792,7 +873,7 @@ async def cmd_doctor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _reply(update, "\n".join(lignes))
 
 # ------------------------------------------------------------
-# Photos → analyse d'image via qwen/qwen3.6-27b (vision)
+# Photos → analyse d'image via qwen/qwen3.8-27b (vision)
 # ------------------------------------------------------------
 async def handler_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Reçoit une photo Telegram, la télécharge temporairement et l'analyse
@@ -902,8 +983,10 @@ async def handler_document_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 # Anti-rebond : évite le double traitement 
 _en_cours: set[int] = set()
 
-async def handler_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global _exchange_idx, _skills_index
+_last_prompt: str = ""      # dernier message texte traité (pour /retry)
+
+async def handler_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE, override: str | None = None):
+    global _exchange_idx, _skills_index, _last_prompt
 
     if not await _est_autorise(update):
         await update.message.reply_text("⛔ Accès refusé.")
@@ -914,16 +997,16 @@ async def handler_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     _en_cours.add(msg_id)
 
-    user_input = (update.message.text or "").strip()
+    user_input = override if override is not None else (update.message.text or "").strip()
     if not user_input:
         _en_cours.discard(msg_id)
         return
+    _last_prompt = user_input      # mémorisé AVANT le traitement : un tour en erreur reste relançable
 
     # Un autre processus (session terminal) a pu changer le modèle/température
     # entre-temps -- resynchronise avant de traiter ce message. Même logique
     # que côté CLI (maybe_reload_config), les deux interfaces étant deux
-    # processus indépendants qui ne partagent leur état qu'au travers de
-    # config.yaml.
+    # processus indépendants qui ne partagent leur état qu'au travers de config.yaml.
     _model_avant = ag.GROQ_MODEL
     if ag.maybe_reload_config() and ag.GROQ_MODEL != _model_avant:
         await _reply(update, f"📡 _Modèle synchronisé depuis une autre session : `{ag.GROQ_MODEL}`_")
@@ -933,6 +1016,8 @@ async def handler_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                    action="typing")
 
     try:
+        ag._undo_begin_turn()                 # journal /undo (terminal) : on repart d'un tour vierge, rien ne s'accumule
+        ag._web_begin_turn(user_input)        # état « web » du tour (liste blanche d'hôtes, contamination)
         # ── Skill Router ──────────────────────────────────────────────────────
         skill_name, route_method = ag.route_skill(user_input, _skills_index)
         skill_content = ag.load_skill_content(skill_name) if skill_name else None
@@ -1034,13 +1119,69 @@ async def handler_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ag.EXCHANGE_IDX = _exchange_idx
         ag.save_config()
 
-        ag._BACKGROUND_EXECUTOR.submit(ag.extract_and_store_facts, user_input, response)
+        # Tour ayant lu du web (outil web_search/web_fetch) : pas d'extraction automatique de faits
+        # (une page piégée ne doit pas écrire dans la mémoire longue) — comme côté terminal.
+        if not ag._WEB_TURN["used"]:
+            ag._BACKGROUND_EXECUTOR.submit(ag.extract_and_store_facts, user_input, response)
 
     except Exception as exc:
         logger.error(f"handler_message exception : {exc}", exc_info=True)
         await _reply(update, f"❌ Erreur interne : {_safe_exc_text(exc)}")
     finally:
         _en_cours.discard(msg_id)
+
+# ------------------------------------------------------------
+# /retry  (relance le dernier message texte ; même traitement qu'un message normal)
+# ------------------------------------------------------------
+async def cmd_retry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _est_autorise(update):
+        await update.message.reply_text("⛔ Accès refusé.")
+        return
+    if not _last_prompt:
+        await _reply(update, "Rien à relancer : aucun message envoyé depuis le démarrage du bot.")
+        return
+    apercu = _last_prompt[:100] + ("…" if len(_last_prompt) > 100 else "")
+    await _reply(update, f"🔁 _Relance :_ {apercu}")
+    await handler_message(update, ctx, override=_last_prompt)
+
+# ------------------------------------------------------------
+# /scanmails  (déclenchement à la demande de emails_scan.py)
+# ------------------------------------------------------------
+EMAILS_SCAN_SCRIPT = os.path.expanduser(
+    "~/Projects/Groq_agent/Scan_emails/emails_scan.py"
+)
+
+async def cmd_scanmails(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _est_autorise(update):
+        await update.message.reply_text("⛔ Accès refusé.")
+        return
+
+    args = ctx.args if ctx.args else []
+    dry_run = "--live" not in args
+    mode_txt = "DRY-RUN (aucune action réelle)" if dry_run else "LIVE"
+    await _reply(update, f"📧 Scan emails lancé ({mode_txt})… patiente, ça peut prendre 1-2 min.")
+
+    cmd = [sys.executable, EMAILS_SCAN_SCRIPT] + args
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await _reply(update, "⏱ Scan interrompu après 5 min (timeout).")
+            return
+
+        sortie = stdout.decode(errors="replace").strip()
+        if proc.returncode != 0:
+            await _reply(update, f"❌ emails_scan.py a échoué (code {proc.returncode}) :\n{_trunc(sortie, 3500)}")
+        else:
+            await _reply(update, _trunc(sortie, 3800) or "✅ Scan terminé, aucune sortie.")
+    except Exception as exc:
+        await _reply(update, f"❌ Erreur au lancement du scan : {_safe_exc_text(exc)}")
 
 # ------------------------------------------------------------
 # Attente synchronisation NTP
@@ -1080,6 +1221,11 @@ async def message_demarrage(application) -> None:
             BotCommand("reflect", "Active/désactive l'auto-évaluation"),
             BotCommand("temp",    "Change la température"),
             BotCommand("clear",   "Efface la mémoire courte"),
+            BotCommand("new",     "Nouvelle session (archive l'ancienne)"),
+            BotCommand("sessions","Liste les sessions archivées"),
+            BotCommand("resume",  "Reprend une session archivée"),
+            BotCommand("quota",   "Quotas Groq (60 s / 24 h)"),
+            BotCommand("retry",   "Relance ton dernier message"),
         ])
     except Exception as e:
         logger.warning(f"set_my_commands a échoué (non bloquant) : {e}")
@@ -1147,6 +1293,11 @@ def main():
     app.add_handler(CommandHandler("status",  cmd_status))
     app.add_handler(CommandHandler("model",   cmd_model))
     app.add_handler(CommandHandler("clear",   cmd_clear))
+    app.add_handler(CommandHandler("new",      cmd_new))
+    app.add_handler(CommandHandler("sessions", cmd_sessions))
+    app.add_handler(CommandHandler("resume",   cmd_resume))
+    app.add_handler(CommandHandler("quota",    cmd_quota))
+    app.add_handler(CommandHandler("retry",    cmd_retry))
     app.add_handler(CommandHandler("mem",     cmd_mem))
     app.add_handler(CommandHandler("compact", cmd_compact))
     app.add_handler(CommandHandler("skills",  cmd_skills))
@@ -1156,6 +1307,7 @@ def main():
     app.add_handler(CommandHandler("tool",    cmd_tool))
     app.add_handler(CommandHandler("tools",   cmd_tools))
     app.add_handler(CommandHandler("doctor",  cmd_doctor))
+    app.add_handler(CommandHandler("scanmails", cmd_scanmails))
     app.add_handler(CallbackQueryHandler(callback_dispatch))
     app.add_handler(MessageHandler(filters.PHOTO, handler_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handler_document_image))
