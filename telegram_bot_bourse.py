@@ -177,7 +177,7 @@ SP500_SYMBOLS = {
     "Nasdaq Inc.": "NDAQ", "Netflix": "NFLX", "NextEra Energy": "NEE",
     "Nike": "NKE", "NVIDIA": "NVDA", "NXP Semiconductors": "NXPI",
     "Oracle": "ORCL", "Palo Alto Networks": "PANW",
-    "Paramount Skydance": "PSKY", "PayPal": "PYPL", "PepsiCo": "PEP",
+    "Skydance Corporation": "SKYD", "PayPal": "PYPL", "PepsiCo": "PEP",
     "Pfizer": "PFE", "Philip Morris": "PM", "Procter & Gamble": "PG",
     "Prologis": "PLD", "PTC Inc.": "PTC", "Qualcomm": "QCOM",
     "Ralph Lauren": "RL", "Rockwell Automation": "ROK", "RTX": "RTX",
@@ -188,7 +188,7 @@ SP500_SYMBOLS = {
     "Thermo Fisher": "TMO", "T-Mobile US": "TMUS",
     "Travelers Companies": "TRV", "Uber": "UBER", "UnitedHealth": "UNH",
     "UPS": "UPS", "Verizon": "VZ", "Visa": "V", "Walmart": "WMT",
-    "Walt Disney": "DIS", "Warner Bros. Discovery": "WBD",
+    "Walt Disney": "DIS",
     "Western Digital": "WDC", "Zimmer Biomet": "ZBH",
 }
 
@@ -259,6 +259,14 @@ def _load_state():
             _state["watchlist"]  = saved.get("watchlist",  DEFAULT_WATCHLIST.copy())
             _state["alerts"]     = saved.get("alerts",     {})
             _state["_triggered"] = saved.get("_triggered", {})
+            # Migration : valeur renommée (PSKY → SKYD) / disparue (WBD racheté)
+            for d in (_state["alerts"], _state["_triggered"]):
+                if "Paramount Skydance" in d:
+                    d["Skydance Corporation"] = d.pop("Paramount Skydance")
+                d.pop("Warner Bros. Discovery", None)
+            wl = ["Skydance Corporation" if n == "Paramount Skydance" else n
+                  for n in _state["watchlist"] if n != "Warner Bros. Discovery"]
+            _state["watchlist"] = wl
         log.info(f"État chargé : {len(_state['watchlist'])} valeurs, "
                  f"{len(_state['alerts'])} alertes")
     except (FileNotFoundError, json.JSONDecodeError):
@@ -294,6 +302,16 @@ def _fetch_one_yf(name: str, symbol: str) -> tuple[str, dict | None]:
         except Exception as e:
             log.warning(f"{name} ({symbol}) : {type(e).__name__} — {e}")
             return name, None
+
+    # Repli : si previous_close est absent (changement de ticker, opération
+    # sur titres…), on le déduit de l'historique journalier
+    if price and not prev:
+        try:
+            closes = yf.Ticker(symbol).history(period="5d", auto_adjust=False)["Close"].dropna()
+            if len(closes) >= 2:
+                prev = float(closes.iloc[-2])
+        except Exception as e:
+            log.warning(f"{name} ({symbol}) : repli historique impossible — {e}")
 
     if price and prev and prev > 0:
         return name, {
