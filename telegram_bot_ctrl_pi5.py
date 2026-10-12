@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-#  Bot Telegram — Ctrl & Sécurité (Raspberry Pi 5 - 16Go RAM - 256Go SSD NVMe)
+#  Bot Telegram — Ctrl & Sécurité (Raspberry Pi 5 - 16Go RAM - 1To SSD NVMe)
 #
 #  Commandes :
 #    /aide         Menu des commandes
@@ -8,6 +8,7 @@
 #    /reseau       Interfaces et adresses IP (format lisible)
 #    /scan_reseau  Appareils présents sur le réseau local (nmap)
 #    /disque       Espace disque (partitions réelles uniquement)
+#    /info_backup  Résultat de la dernière sauvegarde NVMe (lit backup_cron.log)
 #    /fail2ban     Bans actifs + tentatives récentes
 #    /ufw          Statut et règles du pare-feu
 #    /ufw_toggle   Active ou désactive UFW (confirmation requise)
@@ -37,6 +38,7 @@
 #      chat_id    = VOTRE_CHAT_ID
 #
 #  Auteur : Jean-François BRUNET – JFBConseils – Mai 2026
+#  Rév.   : Octobre 2026
 # =============================================================================
 
 import asyncio
@@ -257,6 +259,85 @@ class AlertManager:
         return False
 
 # =============================================================================
+#  Sauvegarde NVMe -> USB / SD (Backup_cron.py)
+# =============================================================================
+
+BACKUP_LOG      = Path.home() / "Projects" / "Backup_NVMe" / "backup_cron.log"
+BACKUP_MAX_DAYS = 8   # au-delà, la sauvegarde hebdomadaire est jugée en retard
+
+_RE_HORODATAGE = re.compile(r"^\[(\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2})\] ?(.*)$")
+
+def _resume_derniere_sauvegarde() -> str:
+    """Résume le dernier passage de Backup_cron.py à partir de backup_cron.log
+    (le fichier est en mode ajout : on isole le dernier bloc « Début Sauvegarde »)."""
+    if not BACKUP_LOG.exists():
+        return f"❓ Journal introuvable : {BACKUP_LOG}"
+    try:
+        with open(BACKUP_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 2_000_000))
+            texte = f.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        return f"❌ Lecture de {BACKUP_LOG.name} impossible : {exc}"
+
+    lignes = texte.splitlines()
+    debut = None
+    for i, l in enumerate(lignes):
+        if "########## Début Sauvegarde" in l:
+            debut = i
+    if debut is None:
+        return "❓ Aucune sauvegarde trouvée dans le journal."
+    bloc = lignes[debut:]
+
+    termine = any("########## Fin Sauvegarde" in l for l in bloc)
+    resultats, anomalies, apres = [], [], []
+    duree = ""
+    t_debut = None
+    for l in bloc:
+        m = _RE_HORODATAGE.match(l)
+        if not m:
+            continue
+        ts, msg = m.groups()
+        if t_debut is None and "Début Sauvegarde" in msg:
+            t_debut = datetime.strptime(ts, "%d/%m/%Y %H:%M:%S")
+        if re.match(r"\s*(USB|SD)\s*: (OK|ECHEC)", msg):
+            resultats.append(msg.strip())
+        elif msg.startswith("Durée totale"):
+            duree = msg.strip()
+        elif "(après backup)" in msg:
+            apres.append(msg.strip())
+        elif msg.startswith(("[WARN", "ERREUR")) or "ECHEC (code" in msg:
+            anomalies.append(msg.strip()[:200])
+
+    echec = any("ECHEC" in r for r in resultats)
+    if not termine:
+        icone, titre = "⏳", "en cours ou interrompue (pas de ligne de fin)"
+    elif echec:
+        icone, titre = "❌", "ÉCHEC"
+    elif anomalies:
+        icone, titre = "⚠️", "terminée avec anomalies"
+    else:
+        icone, titre = "✅", "OK"
+
+    sortie = [f"{icone} Dernière sauvegarde NVMe : {titre}"]
+    if t_debut:
+        age = (datetime.now() - t_debut).total_seconds() / 86400
+        sortie.append(f"🕒 {t_debut.strftime('%d/%m/%Y %H:%M')} (il y a {age:.1f} j)")
+        if age > BACKUP_MAX_DAYS:
+            sortie.append(f"⚠️ Plus de {BACKUP_MAX_DAYS} jours : sauvegarde hebdomadaire en retard ?")
+    sortie += [f"• {r}" for r in resultats]
+    sortie += [f"• {a}" for a in apres]
+    if duree:
+        sortie.append(f"• {duree}")
+    if anomalies:
+        sortie.append("")
+        sortie.append(f"Anomalies ({len(anomalies)}) :")
+        sortie += [f"- {a}" for a in anomalies[:8]]
+        if len(anomalies) > 8:
+            sortie.append(f"… et {len(anomalies) - 8} autre(s), voir {BACKUP_LOG.name}")
+    return "\n".join(sortie)
+
+# =============================================================================
 #  Handlers des commandes
 # =============================================================================
 
@@ -270,6 +351,7 @@ async def cmd_aide(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/reseau — Interfaces réseau\n"
         "/scan\\_reseau — Appareils sur réseau\n"
         "/disque — Espace disque\n"
+        "/info\\_backup — Dernier backup NVMe\n"
         "/fail2ban — Bans actifs & intrusions\n"
         "/ufw — Statut pare-feu UFW\n"
         "/ufw\\_toggle — ⚠️ On/Off UFW\n"
@@ -379,6 +461,11 @@ async def cmd_disque(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{emoji} *Espace disque* (partitions principales)\n\n`{_truncate(out)}`",
         parse_mode="Markdown"
     )
+
+async def cmd_info_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Résumé de la dernière sauvegarde NVMe -> USB/SD (lecture de backup_cron.log)."""
+    texte = await asyncio.to_thread(_resume_derniere_sauvegarde)
+    await update.message.reply_text(_truncate(texte))   # texte brut : pas de souci de Markdown
 
 async def cmd_fail2ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["🛡 *Fail2Ban*\n"]
@@ -1047,6 +1134,7 @@ def main():
     app.add_handler(CommandHandler("reseau",      cmd_reseau))
     app.add_handler(CommandHandler("scan_reseau", cmd_scan_reseau))
     app.add_handler(CommandHandler("disque",      cmd_disque))
+    app.add_handler(CommandHandler("info_backup", cmd_info_backup))
     app.add_handler(CommandHandler("fail2ban",    cmd_fail2ban))
     app.add_handler(CommandHandler("ufw",         cmd_ufw))
     app.add_handler(CommandHandler("ufw_toggle",  cmd_ufw_toggle))
