@@ -51,7 +51,11 @@ COMMANDES_MENU = [
     ("ok", "Valider l'étape"),
     ("etat", "Où en est-on ?"),
     ("guide", "Rappel de l'étape (attendu, points, outils)"),
-    ("modele", "Moteur et modèles IA (boutons)"),
+    ("sauter", "Sauter la question en cours"),
+    ("prec", "Question précédente"),
+    ("reponse", "Relire mes réponses de l'étape"),
+    ("modele", "Moteur, modèles IA et mode (boutons)"),
+    ("mode", "Mode : guidé, rapide ou libre"),
     ("projets", "Mes projets : rouvrir, supprimer"),
     ("sauver", "Enregistrer le projet (+ titre)"),
     ("titre", "Définir ou modifier le titre"),
@@ -65,7 +69,7 @@ COMMANDES_MENU = [
 
 # Boutons qui modifient l'état : le clavier du message est retiré après le clic (pas de double clic)
 COMMANDES_A_USAGE_UNIQUE = {"/ok", "/passer", "/retour", "/stop", "/nouveau", "/charger",
-                            "/supprimer", "/8d", "/a3", "/pdca", "/k6pts"}
+                            "/supprimer", "/8d", "/a3", "/pdca", "/k6pts", "/sauter", "/prec"}
 
 def lire_config_telegram():
     cp = configparser.RawConfigParser()
@@ -254,7 +258,8 @@ class Bot:
                  f"📅 {datetime.now():%d/%m/%Y %H:%M:%S}{ntp_avert}\n\n"
                  f"📡 Moteur : {b}\n"
                  f"🧠 Texte : {session.modele('texte')}\n"
-                 f"📷 Photos : {session.modele('vision')}\n")
+                 f"📷 Photos : {session.modele('vision')}\n"
+                 f"🧭 Mode : {session.mode}\n")
         if session.methode:
             avance = ("terminé" if session.fini else f"étape {session.idx + 1}/{len(session.etapes)}")
             texte += (f"\n📂 Projet en cours : « {session.titre} » "
