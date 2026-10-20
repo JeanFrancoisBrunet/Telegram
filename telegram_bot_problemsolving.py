@@ -22,7 +22,7 @@
 #  Lancement  : python3 telegram_bot_problemsolving.py
 #  Service    : voir la fiche « Bot Telegram » (systemd, ...)
 #  Auteur : Jean-François BRUNET – JFBConseils – Octobre 2026
-#  Rev.   : 2 — boutons (modèles, projets, validation), historique, projets rechargeables
+#  Rev.   : 
 # =============================================================================
 
 import os
@@ -56,11 +56,11 @@ COMMANDES_MENU = [
     ("reponse", "Relire mes réponses de l'étape"),
     ("modele", "Moteur, modèles IA et mode (boutons)"),
     ("mode", "Mode : guidé, rapide ou libre"),
-    ("projets", "Mes projets : rouvrir, supprimer"),
+    ("projets", "Mes projets : ré-ouvrir, supprimer"),
     ("sauver", "Enregistrer le projet (+ titre)"),
     ("titre", "Définir ou modifier le titre"),
     ("historique", "Relire les échanges de l'étape"),
-    ("rapport", "Générer le rapport (complet = avec échanges)"),
+    ("rapport", "Générer le rapport (complet avec échanges)"),
     ("retour", "Revenir à l'étape précédente"),
     ("passer", "Passer l'étape"),
     ("stop", "Mettre le projet de côté"),
@@ -267,7 +267,7 @@ class Bot:
             boutons = [[("📊 État", "/etat"), ("📜 Historique", "/historique")],
                        [("📂 Projets", "/projets"), ("🤖 Modèle", "/modele")]]
         else:
-            texte += "\n/8d · /a3 · /pdca · /k6pts pour commencer, /projets pour rouvrir un projet.\n"
+            texte += "\n/8d · /a3 · /pdca · /k6pts pour commencer, /projets pour ré-ouvrir un projet.\n"
             boutons = ps.BTN_DEMARRER
         self.envoyer(self.proprio, ps.msg(texte, boutons))
 
