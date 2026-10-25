@@ -33,7 +33,14 @@
 #    ExecStart=/usr/bin/libcamerify /usr/bin/motion
 #    sudo systemctl daemon-reload
 #
+#  Dossier de log (protégé contre un nettoyage type BleachBit) :
+#    /etc/systemd/system/motion.service.d/override.conf
+#    [Service]
+#    LogsDirectory=motion
+#
 #  Auteur : Jean-François BRUNET – JFBConseils – Juin 2026
+#  Mise à jour : Octobre 2026 – diagnostic IMX708 via libcamera
+#                (Motion passe par /dev/video0 via libcamerify)
 # =============================================================================
 
 import asyncio
@@ -64,7 +71,7 @@ TOKEN_KEY    = "token_motion"
 
 SYSTEMCTL                = "/usr/bin/systemctl"
 LIBCAMERIFY              = "/usr/bin/libcamerify"
-MOTION_DEV_IMX708        = "/dev/video8"
+MOTION_DEV_VIDEO         = "/dev/video0"   # device vu par Motion via libcamerify
 PI5_IP                   = "192.168.1.200"
 MOTION_WEB_CTRL          = f"http://{PI5_IP}:8080"
 MOTION_WEB_STREAM        = f"http://{PI5_IP}:8081"
@@ -178,8 +185,25 @@ class MotionController:
             return False
 
     @staticmethod
+    def check_log_dir() -> bool:
+        """Vérifie que le dossier de log de Motion existe (sa disparition
+        provoque un plantage au démarrage)."""
+        return os.path.isdir("/var/log/motion")
+
+    @staticmethod
     def check_device_imx708() -> bool:
-        return os.path.exists(MOTION_DEV_IMX708)
+        """Vérifie que l'IMX708 est détectée par libcamera.
+        Motion y accède via libcamerify sur /dev/video0 (pas un nœud fixe) :
+        on interroge donc libcamera plutôt qu'un chemin /dev/videoN.
+        Repli : simple test d'existence de MOTION_DEV_VIDEO."""
+        try:
+            r = subprocess.run(
+                ["rpicam-hello", "--list-cameras"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return "imx708" in (r.stdout + r.stderr).lower()
+        except Exception:
+            return os.path.exists(MOTION_DEV_VIDEO)
 
     @staticmethod
     def demarrer() -> tuple[bool, str]:
@@ -326,9 +350,13 @@ class CaptureWatcher:
                     )
                     continue
 
-                ts = datetime.fromtimestamp(
-                    img_path.stat().st_mtime
-                ).strftime("%d/%m/%Y %H:%M:%S")
+                try:
+                    ts = datetime.fromtimestamp(
+                        img_path.stat().st_mtime
+                    ).strftime("%d/%m/%Y %H:%M:%S")
+                except FileNotFoundError:
+                    # Fichier supprimé entre le scan et l'envoi (ex. /effacer)
+                    continue
 
                 caption = (
                     f"🚨 *Détection Motion – IMX708*\n"
@@ -484,12 +512,14 @@ def _alertes_emoji() -> str:
 def _build_diagnostics() -> str:
     lc_ok   = MotionController.check_libcamerify()
     svc_ok  = MotionController.check_service_patched()
+    log_ok  = MotionController.check_log_dir()
     dev_ok  = MotionController.check_device_imx708()
     cap_dir = MotionController.get_capture_dir()
     lines = [
         f"{'✅' if lc_ok  else '❌'} libcamerify : `{LIBCAMERIFY}`",
         f"{'✅' if svc_ok else '❌'} Service patché (libcamerify dans .service)",
-        f"{'✅' if dev_ok else '❌'} Périphérique IMX708 : `{MOTION_DEV_IMX708}`\n",
+        f"{'✅' if log_ok else '❌'} Dossier de log : `/var/log/motion`",
+        f"{'✅' if dev_ok else '❌'} Caméra IMX708 détectée par libcamera\n",
         f"📁 Dossier  : `{cap_dir}`",
         f"🌐 Web Ctrl : `{MOTION_WEB_CTRL}`",
         f"📹 Stream   : `{MOTION_WEB_STREAM}`",
@@ -518,7 +548,7 @@ def _list_all_captures(capture_dir: Path) -> list[Path]:
         ]
     except FileNotFoundError:
         return []
-        
+
 def _format_size(size_bytes: int) -> str:
     if size_bytes < 1024:
         return f"{size_bytes} o"
@@ -583,7 +613,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if watcher.enabled else
         "🔕 Alertes *désactivées*"
     )
-    diag = _build_diagnostics()
+    # rpicam-hello --list-cameras peut prendre ~1 s : hors de la boucle asyncio
+    diag = await asyncio.to_thread(_build_diagnostics)
 
     await update.message.reply_text(
         f"📊 *Statut Motion – IMX708*\n\n"
