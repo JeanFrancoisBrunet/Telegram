@@ -8,6 +8,7 @@
 #    (/projets), titre… Un bouton = une commande (voir problem_solving.msg)
 #  - Photo (ou image envoyée comme fichier) : analysée au regard de l'étape en cours ;
 #    la légende de la photo sert de question
+#  - Autre fichier (PDF, texte, tableur…) : joint à l'étape comme preuve, versé au rapport
 #  - Projets enregistrés à chaque message et rechargeables (/projets, /charger) avec tout
 #    l'historique des échanges ; au redémarrage du bot, le projet en cours est repris
 #  - Le rapport (simple ou complet avec les échanges) est renvoyé dans la conversation
@@ -221,8 +222,15 @@ class Bot:
             elif msg.get("text"):
                 msgs, fichier = session.handle(msg["text"])
                 self._livrer(chat_id, msgs, fichier)
-            elif msg.get("document"):
-                self.envoyer(chat_id, "Envoyez une image (photo ou fichier image) ou du texte.")
+            elif msg.get("document"):                             # autre fichier : pièce jointe (preuve)
+                doc = msg["document"]
+                if (doc.get("file_size") or 0) > 20 * 1024 * 1024:
+                    self.envoyer(chat_id, "⚠️ Fichier trop volumineux : 20 Mo au maximum.")
+                else:
+                    donnees = self.telecharger(doc["file_id"])
+                    msgs = session.joindre_piece(donnees, doc.get("file_name") or "document",
+                                                 (msg.get("caption") or "").strip())
+                    self._livrer(chat_id, msgs, None)
         self._executer(chat_id, travail)
 
     # -- clic sur un bouton : la commande du bouton est exécutée comme si elle était tapée

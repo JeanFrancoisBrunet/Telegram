@@ -10,6 +10,7 @@
 #    • LLM Llama          → telegram-bot-llm.service
 #    • Agent Groq         → telegram-bot-groq.service
 #    • Problem Solving    → telegram-bot-problemsolving.service
+#    • Statistiques       → telegram-bot-statistiques.service
 #    • Suivi Bourse       → telegram-bot-bourse.service
 #    • Ctrl & Sécurité    → telegram-bot-ctrl.service
 #
@@ -81,6 +82,10 @@ BOTS: dict[str, dict] = {
     "Problem": {
         "label":   "Problem Solving -",
         "service": "telegram-bot-problemsolving.service",
+    },
+    "Statistiques": {
+        "label":   "Statistiques          -",
+        "service": "telegram-bot-statistiques.service",
     },
     "bourse": {
         "label":   "Suivi Bourse         -",
