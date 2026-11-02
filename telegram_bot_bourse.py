@@ -119,6 +119,10 @@ def _setup_logging():
     root.setLevel(logging.INFO)
     root.addHandler(file_handler)
     root.addHandler(console_handler)
+    # httpx journalise chaque requête avec l'URL complète, donc le TOKEN du bot,
+    # dans le fichier journal et dans journalctl.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 _setup_logging()
 log = logging.getLogger("bourse_bot")

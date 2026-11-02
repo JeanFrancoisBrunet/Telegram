@@ -107,6 +107,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
 )
+# httpx journalise chaque requête avec l'URL complète, donc le TOKEN du bot, dans journalctl.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 # =============================================================================
