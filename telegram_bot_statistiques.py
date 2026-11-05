@@ -297,7 +297,7 @@ class Session:
 
     # -- aide -----------------------------------------------------------------------------
     def c_start(self, args, a_liberer):
-        return [msg("📊 Atelier statistique\n\nEnvoyez vos données en message texte ou en fichier joint "
+        return [msg("📊 Statistiques\n\nEnvoyez vos données en message texte ou en fichier joint "
                     "(csv, txt, tsv, dat, xlsx), puis choisissez une analyse. /aide pour le détail.", BTN_MENU)]
 
     def c_aide(self, args, a_liberer):
