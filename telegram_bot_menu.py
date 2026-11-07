@@ -3,16 +3,17 @@
 #  Bot Telegram — Menu Pi5 (Bot Maître)
 #  Raspberry Pi 5 - 16Go RAM - 1To SSD NVMe
 #
-#  Gestion On/Off des 8 bots via boutons inline Telegram :
-#    • Caméra IMX500      → telegram-bot-imx500.service
-#    • Caméra IMX708      → telegram-bot-cam.service
-#    • Motion IMX708      → telegram-bot-motion.service
-#    • LLM Llama          → telegram-bot-llm.service
-#    • Agent Groq         → telegram-bot-groq.service
-#    • Problem Solving    → telegram-bot-problemsolving.service
-#    • Statistiques       → telegram-bot-statistiques.service
-#    • Suivi Bourse       → telegram-bot-bourse.service
-#    • Ctrl & Sécurité    → telegram-bot-ctrl.service
+#  Gestion On/Off des 10 bots via boutons inline Telegram :
+#    • Caméra IMX500           → telegram-bot-imx500.service
+#    • Caméra IMX708           → telegram-bot-cam.service
+#    • Motion IMX708           → telegram-bot-motion.service
+#    • LLM Llama               → telegram-bot-llm.service
+#    • Agent Groq              → telegram-bot-groq.service
+#    • Problem Solving         → telegram-bot-problemsolving.service
+#    • Statistiques            → telegram-bot-statistiques.service
+#    • Design of Experiments   → telegram-bot-doe.service
+#    • Suivi Bourse            → telegram-bot-bourse.service
+#    • Ctrl & Sécurité         → telegram-bot-ctrl.service
 #
 #  Commandes :
 #    /aide    Menu des commandes
@@ -28,7 +29,7 @@
 #  debounce par verrou, polling d'état post-action...
 #
 #  Auteur : Jean-François BRUNET – JFBConseils – Juin 2026
-#  Rév.   : Octobre 2026
+#  Rév.   : Novembre 2026
 # =============================================================================
 
 import asyncio
@@ -60,39 +61,43 @@ SERVICE_WAIT_TIMEOUT = 5
 # Correspondance nom affiché → nom du service systemd
 BOTS: dict[str, dict] = {
     "imx500": {
-        "label":   "Caméra IMX500   -",
+        "label":   "Caméra IMX500             -",
         "service": "telegram-bot-imx500.service",
     },
     "imx708": {
-        "label":   "Caméra IMX708   -",
+        "label":   "Caméra IMX708             -",
         "service": "telegram-bot-cam.service",
     },
     "motion": {
-        "label":   "Motion IMX708    -",
+        "label":   "Motion IMX708              -",
         "service": "telegram-bot-motion.service",
     },
     "llm": {
-        "label":   "LLM Llama            -",
+        "label":   "LLM Llama                      -",
         "service": "telegram-bot-llm.service",
     },
     "groq": {
-        "label":   "Agent Groq           -",
+        "label":   "Agent Groq                     -",
         "service": "telegram-bot-groq.service",
     },
     "Problem": {
-        "label":   "Problem Solving -",
+        "label":   "Problem Solving           -",
         "service": "telegram-bot-problemsolving.service",
     },
     "Statistiques": {
-        "label":   "Statistiques          -",
+        "label":   "Statistiques                    -",
         "service": "telegram-bot-statistiques.service",
     },
+    "DoE": {
+        "label":   "Design of Experiments -",
+        "service": "telegram-bot-doe.service",
+    },
     "bourse": {
-        "label":   "Suivi Bourse         -",
+        "label":   "Suivi Bourse                   -",
         "service": "telegram-bot-bourse.service",
     },
     "ctrl": {
-        "label":   "Ctrl & Sécurité     -",
+        "label":   "Ctrl & Sécurité               -",
         "service": "telegram-bot-ctrl.service",
     },
 }
