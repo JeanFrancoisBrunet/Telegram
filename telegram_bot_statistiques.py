@@ -5,7 +5,8 @@
 #  Importe statistiques.py (même cœur que l'application de bureau ; calculs réalisés par R).
 #  - Données : un message texte (une série par colonne, noms de colonnes en première
 #    ligne) ou un fichier joint (csv, txt, tsv, dat, xlsx) — saisie possible depuis le S23
-#  - Analyses : descriptif, normalité, tests t, ANOVA (+ Tukey), capabilité, Kappa ;
+#  - Analyses : descriptif, normalité, tests t, Z, F, Poisson, ANOVA, khi², estimation, identification de loi, corrélation,
+#    régression, séries, cartes de contrôle (dont p et u, avant/après), graphiques, capabilité, Kappa, génération de données ;
 #    menus à boutons, résultats en texte à chasse fixe + graphiques en images
 #  - Les données d'une conversation restent en mémoire du bot (rien n'est écrit sur disque)
 #
@@ -53,6 +54,22 @@ COMMANDES_MENU = [
     ("anova", "ANOVA à un facteur (+ Tukey)"),
     ("capa", "Capabilité (Pp/Ppk, Cp/Cpk)"),
     ("kappa", "Kappa de Cohen"),
+    ("f", "Test F de comparaison de deux variances"),
+    ("z", "Test Z (écart-type connu)"),
+    ("poisson", "Test de Poisson (1 ou 2 échantillons)"),
+    ("estimation", "Estimation d'une moyenne (intervalle de confiance)"),
+    ("identification", "Identification de loi"),
+    ("correlation", "Corrélation"),
+    ("regression", "Régression"),
+    ("serie", "Série chronologique et tendances"),
+    ("khi2", "Test du khi² d'indépendance"),
+    ("carte", "Carte de contrôle (X-barre, I-MR, avant/après)"),
+    ("cartep", "Cartes p et u (attributs)"),
+    ("graphique", "Graphiques"),
+    ("generer", "Générer des données aléatoires"),
+    ("illustration", "Illustrations de référence"),
+    ("groupe", "Analyser par groupe (colonne de groupes)"),
+    ("alpha", "Risque α des tests"),
     ("lecture", "Options de lecture (séparateur, décimale)"),
     ("export", "Récupérer les données en CSV"),
     ("effacer", "Effacer les données"),
@@ -67,6 +84,11 @@ LIMITE_MESSAGE = 3600
 BTN_MENU = [[("📈 Descriptif", "/descriptif"), ("🔔 Normalité", "/normalite")],
             [("⚖️ Test t", "/t"), ("🧪 ANOVA", "/anova")],
             [("🎯 Capabilité", "/capa"), ("🤝 Kappa", "/kappa")],
+            [("🔬 Test Z", "/z"), ("📐 Estimation", "/estimation")],
+            [("🔎 Identif. de loi", "/identification"), ("🔗 Corrélation", "/correlation")],
+            [("📉 Régression", "/regression"), ("⏳ Série chrono.", "/serie")],
+            [("📊 Graphiques", "/graphique"), ("📏 Cartes", "/carte")],
+            [("🎲 Générer", "/generer"), ("🖼 Illustrations", "/illustration")],
             [("📤 Export CSV", "/export"), ("📋 Données", "/etat")]]
 
 
@@ -226,14 +248,29 @@ class Session:
 
     def liste_colonnes(self):
         d = self.donnees()
-        return "\n".join(f"{i}. {n} ({'numérique' if d.types[n] == 'num' else 'texte'})" for i, n in enumerate(d.noms, 1))
+        return "\n".join(f"{i}. {n} ({ {'num': 'numérique', 'date': 'date'}.get(d.types[n], 'texte') })" for i, n in enumerate(d.noms, 1))
 
     # -- chargement -------------------------------------------------------------------
+    def _verifier_groupe(self):
+        """Abandonne l'analyse par groupe si la colonne de groupes ou ses valeurs ont disparu des données."""
+        g = self.etude.groupe
+        d = self.etude.donnees
+        if not g:
+            return
+        try:
+            restantes = [v for v in g["valeurs"] if v in d.groupe_valeurs(g["colonne"], g.get("periode"))]
+        except Exception:
+            restantes = []
+        self.etude.groupe = {**g, "valeurs": restantes} if restantes else None
+
     def apres_chargement(self, origine):
         d = self.donnees()
+        self._verifier_groupe()
         txt = f"✅ Données chargées ({origine}) : {d.resume()}\n\n{self.liste_colonnes()}"
         if d.avertissements:
             txt += "\n\n⚠️ " + "\n⚠️ ".join(d.avertissements)
+        if self.etude.groupe:
+            txt += f"\n\n🗂 Analyse par groupe : {self.resume_groupe()} (/groupe aucun pour l'arrêter)."
         txt += "\n\nLes numéros ci-dessus peuvent remplacer les noms dans les commandes."
         return [msg(txt, BTN_MENU)]
 
@@ -280,7 +317,11 @@ class Session:
         table = {"/start": self.c_start, "/aide": self.c_aide, "/help": self.c_aide, "/donnees": self.c_donnees,
                  "/etat": self.c_etat, "/effacer": self.c_effacer, "/annuler": self.c_annuler, "/export": self.c_export,
                  "/lecture": self.c_lecture, "/descriptif": self.c_descriptif, "/normalite": self.c_normalite,
-                 "/t": self.c_t, "/anova": self.c_anova, "/capa": self.c_capa, "/kappa": self.c_kappa}
+                 "/t": self.c_t, "/anova": self.c_anova, "/capa": self.c_capa, "/kappa": self.c_kappa,
+                 "/f": self.c_f, "/z": self.c_z, "/poisson": self.c_poisson, "/estimation": self.c_estimation,
+                 "/identification": self.c_identification, "/correlation": self.c_correlation, "/regression": self.c_regression,
+                 "/serie": self.c_serie, "/khi2": self.c_khi2, "/carte": self.c_carte, "/cartep": self.c_cartep,
+                 "/graphique": self.c_graphique, "/generer": self.c_generer, "/illustration": self.c_illustration, "/alpha": self.c_alpha, "/groupe": self.c_groupe}
         f = table.get(cmd)
         if f is None:
             return [msg("Commande inconnue. /aide pour la liste.")]
@@ -315,6 +356,21 @@ class Session:
             "/anova [colonnes | mesures groupes]\n"
             "/capa [colonne] [LSL] [USL] [cible] [σ intra]  (« - » pour une valeur absente)\n"
             "/kappa [évaluation 1] [évaluation 2]\n"
+            "/f [X] [Y] [sup|inf]\n"
+            "/z [X] σ [mu=…] [sup|inf]   ou   /z X Y σX σY [mu=…]\n"
+            "/poisson X Y [ratio=…]   ou   /poisson X lambda0=… [duree=…]   ou   /poisson total=… duree=… lambda0=…\n"
+            "/estimation [X] [niveau=95] [inf|sup] [marge=…] [sigma=…]   ou   /estimation n=… moyenne=… s=…\n"
+            "/identification [colonnes] [lois=normale,gamma,…] [sim=200]\n"
+            "/correlation [colonnes] [spearman|kendall]\n"
+            "/regression Y X1 [X2 …] [deg=1|2|3]\n"
+            "/serie Y [ordre=colonne] [modeles=lineaire,quadratique,exponentielle,logistique] [horizon=n]\n"
+            "/khi2 A B  (indépendance, données brutes)\n"
+            "/carte colonnes [type=imr|xbar_r|xbar_s] [ordre=col] [phase=col] [rupture=n]\n"
+            "/cartep p|u comptages [effectifs] [n=…] [ordre=col] [phase=col] [rupture=n]\n"
+            "/graphique type colonnes   (histogramme, secteurs, barres, bulles, nuage, individuelles, intervalles, boite, probabilite)\n"
+            "/generer loi [paramètres] [n=30] [dec=3] [graine=…] [nom=…] [remplace]\n"
+            "/groupe [colonne] [jour|mois|annee] [valeurs=a|b]   (aucun : analyse de l'ensemble) — toutes les analyses sont alors lancées groupe par groupe\n"
+            "/illustration [sujet]   ·   /alpha [valeur]\n"
             "Les colonnes se désignent par leur numéro (voir /etat) ou leur nom.\n\n"
             "Autres\n/etat · /export · /effacer · /annuler\n\n"
             "Les données ne sont conservées qu'en mémoire du bot, le temps de la conversation.", BTN_MENU)]
@@ -330,10 +386,13 @@ class Session:
         o = self.lecture
         if o != {"sep": "auto", "dec": "auto", "entete": "auto"}:
             t += f"\n\nOptions de lecture : séparateur {o['sep']!r}, décimale {o['dec']!r}, noms de colonnes {o['entete']}."
+        if self.etude.groupe:
+            t += f"\n\n🗂 Analyse par groupe : {self.resume_groupe()} (/groupe aucun pour l'arrêter)."
         return [msg(t, BTN_MENU)]
 
     def c_effacer(self, args, a_liberer):
         self.etude.donnees = None
+        self.etude.groupe = None
         self.liberer_fichier()
         self.brut = None
         return [msg("🗑 Données effacées.")]
@@ -482,6 +541,344 @@ class Session:
             return [msg(f"Référence : {a}. Deuxième évaluation ?", b, remplace=True)]
         return self._res(self.etude.kappa(a, self.colonne(args[1], "tout")), a_liberer)
 
+    # -- nouvelles analyses ---------------------------------------------------------------------
+    MOTS_ALT = {"sup": "greater", "inf": "less"}
+
+    @staticmethod
+    def _kv(args):
+        """Sépare les arguments libres des arguments nom=valeur (noms en minuscules)."""
+        libres, kv = [], {}
+        for a in args:
+            if "=" in a:
+                k, v = a.split("=", 1)
+                kv[k.strip().lower()] = v.strip()
+            else:
+                libres.append(a)
+        return libres, kv
+
+    @staticmethod
+    def _nombre(kv, cle, nom):
+        return st.lire_nombre(kv[cle], nom) if cle in kv else None
+
+    def _alt(self, libres):
+        """(arguments sans mots sup/inf, hypothèse alternative)."""
+        alt = "two.sided"
+        reste = []
+        for a in libres:
+            if a.lower() in self.MOTS_ALT:
+                alt = self.MOTS_ALT[a.lower()]
+            else:
+                reste.append(a)
+        return reste, alt
+
+    def _suite(self, prefixe, texte):
+        self.attente = {"type": "suite", "prefixe": prefixe}
+        return [msg(texte + "\n/annuler pour abandonner.")]
+
+    def _choisir_col(self, cmd, titre, kind="num", exclure=()):
+        b, noms = self.boutons_colonnes(cmd, kind, exclure=exclure)
+        self.verifier_choix(noms, "numérique" if kind == "num" else "")
+        return [msg(titre, b, remplace=True)]
+
+    def _cols(self, refs, kind="num"):
+        return [self.colonne(r, kind) for r in refs]
+
+    def _facultative(self, kv, cle):
+        return self.colonne(kv[cle], "tout") if kv.get(cle) else None
+
+    def c_alpha(self, args, a_liberer):
+        if args:
+            self.etude.alpha = st.lire_alpha(args[0])
+        a = f"{self.etude.alpha:g}".replace(".", ",")
+        return [msg(f"Risque α des tests : {a}. H0 est rejetée si la p-value est inférieure à α. Modifier : /alpha 0,01", BTN_MENU)]
+
+    def c_f(self, args, a_liberer):
+        self.donnees()
+        libres, alt = self._alt(args)
+        if not libres:
+            return self._choisir_col("/f", "Test F : choisir la série X.")
+        x = self.colonne(libres[0])
+        if len(libres) == 1:
+            return self._choisir_col(f"/f {self.index(x)}", f"Série X : {x}. Comparer à quelle série ?", exclure=(x,))
+        return self._res(self.etude.test_f(x, self.colonne(libres[1]), alt), a_liberer)
+
+    def c_z(self, args, a_liberer):
+        self.donnees()
+        libres, kv = self._kv(args)
+        libres, alt = self._alt(libres)
+        if not libres:
+            return self._choisir_col("/z", "Test Z : choisir la série X.")
+        x = self.colonne(libres[0])
+        if len(libres) == 1:
+            return self._suite(f"/z {self.index(x)}", f"Test Z sur « {x} » : envoyez σ (écart-type connu de la population) [mu=valeur] [sup|inf],\n"
+                                                       "ou, pour deux échantillons : Y σX σY [mu=différence].")
+        mu = self._nombre(kv, "mu", "la valeur de référence") or 0.0
+        if len(libres) == 2:
+            params = {"mode": "1", "x": x, "sigma": st.lire_nombre(libres[1], "σ"), "mu": mu, "alternative": alt}
+        elif len(libres) == 4:
+            params = {"mode": "2", "x": x, "y": self.colonne(libres[1]), "sigma": st.lire_nombre(libres[2], "σX"),
+                      "sigma2": st.lire_nombre(libres[3], "σY"), "mu": mu, "alternative": alt}
+        else:
+            raise st.ErreurStat("Syntaxe : /z X σ [mu=…]   ou   /z X Y σX σY [mu=…].")
+        return self._res(self.etude.commande("z", params), a_liberer)
+
+    def c_poisson(self, args, a_liberer):
+        libres, kv = self._kv(args)
+        libres, alt = self._alt(libres)
+        if not libres and not kv:
+            return self._suite("/poisson", "Test de Poisson. Envoyez par exemple :\n• X lambda0=2 [duree=1]  (un échantillon, colonne de comptages)\n"
+                                           "• X Y [ratio=1]  (deux échantillons)\n• total=12 duree=4 lambda0=2  (totaux saisis)\n"
+                                           "• total=12 duree=4 total2=15 duree2=5 [ratio=1]  (deux échantillons, totaux)")
+        n = lambda c, nom: self._nombre(kv, c, nom)
+        deux = bool(len(libres) >= 2 or "total2" in kv)
+        p = {"mode": "2" if deux else "1", "alternative": alt}
+        libre = "total" in kv
+        if "total" in kv:
+            p.update(source="resume", total=n("total", "le nombre total d'événements"), duree_tot=n("duree", "la taille totale observée"))
+        else:
+            if not libres:
+                raise st.ErreurStat("Indiquer la colonne de comptages (ou total=… duree=…).")
+            p.update(source="col", x=self.colonne(libres[0]), duree=n("duree", "la taille de chaque observation") or 1.0)
+        if deux:
+            if "total2" in kv:
+                p.update(source2="resume", total2=n("total2", "le nombre total d'événements 2"), duree_tot2=n("duree2", "la taille totale observée 2"))
+            else:
+                p.update(source2="col", x2=self.colonne(libres[1]), duree2=n("duree2", "la taille de chaque observation 2") or 1.0)
+                libre = False
+            p["ratio0"] = n("ratio", "le rapport de référence") or 1.0
+            libre = libre and p["source2"] == "resume"
+        else:
+            p["lambda0"] = n("lambda0", "le taux de référence λ0")
+            if p["lambda0"] is None:
+                raise st.ErreurStat("Indiquer le taux de référence : lambda0=…")
+        if not libre:
+            self.donnees()
+        return self._res((self.etude.commande_libre if libre else self.etude.commande)("poisson", p), a_liberer)
+
+    def c_estimation(self, args, a_liberer):
+        libres, kv = self._kv(args)
+        cote = "two.sided"
+        reste = []
+        for a in libres:
+            if a.lower() == "inf":
+                cote = "lower"
+            elif a.lower() == "sup":
+                cote = "upper"
+            else:
+                reste.append(a)
+        niveau = self._nombre(kv, "niveau", "le niveau de confiance") or 95.0
+        p = {"niveau": niveau, "cote": cote, "marge": self._nombre(kv, "marge", "la marge d'erreur"), "sigma": self._nombre(kv, "sigma", "σ")}
+        if "n" in kv or "moyenne" in kv:
+            p.update(source="resume", n=self._nombre(kv, "n", "n"), moyenne=self._nombre(kv, "moyenne", "la moyenne"),
+                     ecart_type=self._nombre(kv, "s", "l'écart-type"))
+            return self._res(self.etude.commande_libre("estimation", p), a_liberer)
+        self.donnees()
+        if not reste:
+            return self._choisir_col("/estimation", "Estimation : quelle série ? (options : niveau=95, inf|sup, marge=…, sigma=…)")
+        p.update(source="col", x=self.colonne(reste[0]))
+        return self._res(self.etude.commande("estimation", p), a_liberer)
+
+    def c_identification(self, args, a_liberer):
+        d = self.donnees()
+        libres, kv = self._kv(args)
+        cols = self._cols(libres) if libres else d.noms_num
+        if not cols:
+            raise st.ErreurStat("Aucune colonne numérique.")
+        lois = [x.strip() for x in kv.get("lois", "normale,lognormale,exponentielle,gamma,weibull,logistique,gumbel").split(",") if x.strip()]
+        sim = self._nombre(kv, "sim", "le nombre de tirages") or 200
+        return self._res(self.etude.commande("identification", {"colonnes": cols, "lois": lois, "simulations": sim}), a_liberer)
+
+    def c_correlation(self, args, a_liberer):
+        d = self.donnees()
+        libres, kv = self._kv(args)
+        methode = "pearson"
+        reste = []
+        for a in libres:
+            if a.lower() in ("pearson", "spearman", "kendall"):
+                methode = a.lower()
+            else:
+                reste.append(a)
+        cols = self._cols(reste) if reste else d.noms_num
+        if len(cols) < 2:
+            raise st.ErreurStat("La corrélation demande au moins deux colonnes numériques.")
+        return self._res(self.etude.commande("correlation", {"colonnes": cols, "methode": methode}), a_liberer)
+
+    def c_regression(self, args, a_liberer):
+        self.donnees()
+        libres, kv = self._kv(args)
+        if not libres:
+            return self._choisir_col("/regression", "Régression : choisir la réponse Y.")
+        y = self.colonne(libres[0])
+        if len(libres) == 1:
+            return self._suite(f"/regression {self.index(y)}", f"Réponse : {y}. Envoyez la ou les variables explicatives X (numéros ou noms) [deg=2].")
+        xs = [x for x in self._cols(libres[1:]) if x != y]
+        deg = str(int(self._nombre(kv, "deg", "le degré") or 1))
+        if deg not in ("1", "2", "3"):
+            raise st.ErreurStat("Le degré doit être 1, 2 ou 3.")
+        return self._res(self.etude.commande("regression", {"y": y, "x": xs, "degre": deg}), a_liberer)
+
+    def c_serie(self, args, a_liberer):
+        self.donnees()
+        libres, kv = self._kv(args)
+        if not libres:
+            return self._choisir_col("/serie", "Série chronologique : quelle série ? (options : ordre=colonne, modeles=…, horizon=n)")
+        y = self.colonne(libres[0])
+        modeles = [m.strip() for m in kv.get("modeles", "lineaire,quadratique,exponentielle,logistique").split(",") if m.strip()]
+        return self._res(self.etude.commande("serie", {"y": y, "ordre": self._facultative(kv, "ordre"), "modeles": modeles,
+                                                       "horizon": self._nombre(kv, "horizon", "l'horizon") or 0}), a_liberer)
+
+    def c_khi2(self, args, a_liberer):
+        d = self.donnees()
+        if not args:
+            return self._choisir_col("/khi2", "Khi² d'indépendance : variable A (lignes) ?", "tout")
+        a = self.colonne(args[0], "tout")
+        if len(args) == 1:
+            return self._choisir_col(f"/khi2 {self.index(a)}", f"Variable A : {a}. Variable B (colonnes) ?", "tout", exclure=(a,))
+        return self._res(self.etude.commande("khi2", {"test": "independance", "format": "brut", "a": a, "b": self.colonne(args[1], "tout")}), a_liberer)
+
+    def c_carte(self, args, a_liberer):
+        self.donnees()
+        libres, kv = self._kv(args)
+        if not libres:
+            return self._choisir_col("/carte", "Carte de contrôle : quelle série ? (plusieurs colonnes = sous-groupes ; options : type=imr|xbar_r|xbar_s, ordre=col, phase=col, rupture=n)")
+        cols = self._cols(libres)
+        type_ = kv.get("type", "auto")
+        if type_ not in ("auto", "imr", "xbar_r", "xbar_s"):
+            raise st.ErreurStat("Type de carte : auto, imr, xbar_r ou xbar_s.")
+        p = {"type": type_, "format": "colonnes", "colonnes": cols, "valeur": "", "groupe": "", "tests": [1, 2, 3, 4],
+             "ordre": self._facultative(kv, "ordre") or "", "phase": self._facultative(kv, "phase") or "",
+             "rupture": self._nombre(kv, "rupture", "le numéro de point")}
+        return self._res(self.etude.commande("carte", p), a_liberer)
+
+    def c_cartep(self, args, a_liberer):
+        self.donnees()
+        libres, kv = self._kv(args)
+        if not libres or libres[0].lower() not in ("p", "u"):
+            return [msg("Cartes d'attributs : /cartep p|u comptages [effectifs] [n=effectif constant] [ordre=col] [phase=col] [rupture=n]\n"
+                        "p : unités défectueuses ; u : défauts par unité.", [[("Carte p", "/cartep p"), ("Carte u", "/cartep u")]])]
+        if len(libres) == 1:
+            return self._choisir_col(f"/cartep {libres[0].lower()}", "Quelle colonne de comptages ? (puis ajoutez la colonne d'effectifs ou n=…)")
+        p = {"type": libres[0].lower(), "defauts": self.colonne(libres[1]), "effectif": self.colonne(libres[2]) if len(libres) > 2 else None,
+             "n": self._nombre(kv, "n", "l'effectif constant"), "ordre": self._facultative(kv, "ordre"), "phase": self._facultative(kv, "phase"),
+             "rupture": self._nombre(kv, "rupture", "le numéro de point"), "tests": [1, 2, 3, 4]}
+        return self._res(self.etude.commande("carte_attributs", p), a_liberer)
+
+    TYPES_GRAPH = {"histogramme": "Histogramme", "secteurs": "Secteurs", "barres": "Barres", "bulles": "Bulles", "nuage": "Nuage de points",
+                   "individuelles": "Valeurs individuelles", "intervalles": "Intervalles", "boite": "Boîte à moustaches", "probabilite": "Diagramme de probabilité"}
+
+    def c_graphique(self, args, a_liberer):
+        d = self.donnees()
+        libres, kv = self._kv(args)
+        if not libres or libres[0].lower() not in self.TYPES_GRAPH:
+            b = [[(lib, f"/graphique {code}") for code, lib in list(self.TYPES_GRAPH.items())[i:i + 2]] for i in range(0, len(self.TYPES_GRAPH), 2)]
+            return [msg("Graphique : quel type ?", b, remplace=True)]
+        code = libres[0].lower()
+        if len(libres) == 1:
+            aide = {"secteurs": "la colonne des catégories", "barres": "la colonne des catégories [valeur=colonne fonction=somme|moyenne]",
+                    "bulles": "X Y Taille", "nuage": "X Y"}.get(code, "une ou plusieurs séries [groupe=colonne]")
+            return self._suite(f"/graphique {code}", f"{self.TYPES_GRAPH[code]} : envoyez {aide} (numéros ou noms).")
+        normale = any(c.lower() == "normale" for c in libres[1:]) or "normale" in kv
+        cols = [c for c in libres[1:] if c.lower() != "normale"]
+        p = {"type_graphique": code}
+        if code in ("secteurs", "barres"):
+            p.update(categorie=self.colonne(cols[0], "tout"), valeur=self._facultative(kv, "valeur"), groupe=self._facultative(kv, "groupe"),
+                     fonction=kv.get("fonction", "effectif"))
+        elif code in ("bulles", "nuage"):
+            if len(cols) < 2 or (code == "bulles" and len(cols) < 3):
+                raise st.ErreurStat("Nuage : X Y ; bulles : X Y Taille.")
+            p.update(x=self.colonne(cols[0]), y=self.colonne(cols[1]), couleur=self._facultative(kv, "couleur"), ajust=True)
+            if code == "bulles":
+                p["taille"] = self.colonne(cols[2])
+        else:
+            p.update(colonnes=self._cols(cols), valeur=None, groupe=self._facultative(kv, "groupe"), normale=normale, loi=kv.get("loi", "normale"))
+        return self._res(self.etude.commande("graphique", p), a_liberer)
+
+    def c_generer(self, args, a_liberer):
+        libres, kv = self._kv(args)
+        lois = {l[1]: l for l in st.LOIS_GENERATION}
+        if not libres or libres[0].lower() not in lois:
+            b = [[(l[0], f"/generer {l[1]}") for l in st.LOIS_GENERATION[i:i + 2]] for i in range(0, len(st.LOIS_GENERATION), 2)]
+            return [msg("Générer des données aléatoires : quelle loi ?", b, remplace=True)]
+        lib, code, params, desc = lois[libres[0].lower()]
+        valeurs = libres[1:]
+        if not valeurs and not kv:
+            noms = ", ".join(f"{p[1]} (défaut {p[2]})" for p in params)
+            return self._suite(f"/generer {code}", f"{lib} — {desc}\nEnvoyez : {noms} [n=30] [dec=3] [graine=…] [nom=…] [remplace], ou « ok » pour les valeurs par défaut.")
+        if valeurs == ["ok"]:
+            valeurs = []
+        if len(valeurs) > len(params):
+            raise st.ErreurStat(f"Cette loi a {len(params)} paramètre(s).")
+        val = {}
+        for k, (cle, nom, defaut) in enumerate(params):
+            v = st.lire_nombre(valeurs[k] if k < len(valeurs) else defaut, nom)
+            val[cle] = v
+        n = int(self._nombre(kv, "n", "le nombre de valeurs") or 30)
+        dec = int(self._nombre(kv, "dec", "le nombre de décimales") if "dec" in kv else (0 if code == "aleatoire" else 3))
+        graine = kv.get("graine")
+        if code == "normale":
+            vals = st.generer_normale(n, val["moyenne"], val["ecart_type"], dec, graine)
+        elif code in ("uniforme", "aleatoire"):
+            vals = st.generer_uniforme(n, val["min"], val["max"], dec, graine)
+        else:
+            vals = self.etude.generer_loi(code, val, n, dec, graine)
+        nom = kv.get("nom") or f"Serie_{(len(self.etude.donnees.noms) if self.etude.donnees else 0) + 1}"
+        nom = self.etude.generer(nom, vals, remplacer=("remplace" in libres or "remplace" in kv))
+        self.brut = None
+        return [msg(f"🎲 {len(vals)} valeur(s) générée(s) ({lib}) : variable « {nom} ».")] + self.apres_chargement("génération")
+
+    def c_illustration(self, args, a_liberer):
+        sujets = dict(st.ILLUSTRATIONS)
+        if not args or args[0] not in sujets:
+            b = [[(titre[:30], f"/illustration {cle}")] for cle, titre in st.ILLUSTRATIONS if st.images_illustration(cle)]
+            if not b:
+                return [msg("Aucune illustration n'est disponible dans le dossier « illustrations » du programme.")]
+            return [msg("Illustrations : quel sujet ?", b, remplace=True)]
+        images = st.images_illustration(args[0])
+        if not images:
+            return [msg(f"Aucune image pour « {sujets[args[0]]} ».")]
+        return [msg(f"🖼 {sujets[args[0]]}")] + [{"photo": f} for f in images]
+
+    # -- analyse par groupe ---------------------------------------------------------------------
+    def resume_groupe(self):
+        g = self.etude.groupe
+        if not g:
+            return "aucune"
+        d = self.donnees()
+        nom = g["colonne"] + ({"jour": " (par jour)", "mois": " (par mois)", "annee": " (par année)"}.get(g.get("periode") or "jour", "") if d.types.get(g["colonne"]) == "date" else "")
+        return f"{nom} — {len(g['valeurs'])} groupe(s) : {', '.join(g['valeurs'][:12])}{' …' if len(g['valeurs']) > 12 else ''}"
+
+    def c_groupe(self, args, a_liberer):
+        d = self.donnees()
+        libres, kv = self._kv(args)
+        if libres and libres[0].lower() in ("aucun", "aucune", "non", "off"):
+            self.etude.groupe = None
+            return [msg("Analyse de l'ensemble des données (plus de groupes).", BTN_MENU)]
+        if not libres:
+            etat = f"Analyse par groupe : {self.resume_groupe()}.\n\n" if self.etude.groupe else ""
+            b, _ = self.boutons_colonnes("/groupe", "tout", supplements=[("Aucun groupe (ensemble des données)", "/groupe aucun")])
+            return [msg(etat + "Quelle colonne désigne les groupes ? Chaque analyse sera lancée groupe par groupe (résultats et graphiques par groupe).", b, remplace=True)]
+        col = self.colonne(libres[0], "tout")
+        periode = None
+        if d.types[col] == "date":
+            choix = next((x.lower() for x in libres[1:] if x.lower() in ("jour", "mois", "annee", "année")), None)
+            if choix is None:
+                i = self.index(col)
+                return [msg(f"« {col} » est une colonne de dates : regrouper par ?", [[("Jour", f"/groupe {i} jour"), ("Mois", f"/groupe {i} mois"), ("Année", f"/groupe {i} annee")]], remplace=True)]
+            periode = "annee" if choix.startswith("ann") else choix
+        tous = d.groupe_valeurs(col, periode)
+        if not tous:
+            raise st.ErreurStat(f"La colonne « {col} » ne contient aucune valeur.")
+        if len(tous) > st.MAX_GROUPES:
+            raise st.ErreurStat(f"La colonne « {col} » compte {len(tous)} groupes : le maximum est {st.MAX_GROUPES}.")
+        retenus = tous
+        if kv.get("valeurs"):
+            retenus = [v for v in tous if v in {x.strip() for x in kv["valeurs"].split("|")}]
+            if not retenus:
+                raise st.ErreurStat("Aucun de ces groupes n'existe. Groupes disponibles : " + ", ".join(tous) + ".")
+        self.etude.groupe = {"colonne": col, "periode": periode, "valeurs": retenus}
+        return [msg(f"🗂 Analyse par groupe : {self.resume_groupe()}.\nToutes les analyses sont maintenant lancées groupe par groupe. "
+                    f"Pour ne garder que certains groupes : /groupe {self.index(col)}{' ' + periode if periode else ''} valeurs=a|b. /groupe aucun pour revenir à l'ensemble.", BTN_MENU)]
+
     def verifier_choix(self, noms, genre):
         if not noms:
             raise st.ErreurStat(f"Aucune colonne {genre} dans les données chargées (voir /etat).")
@@ -500,6 +897,9 @@ class Session:
             res = self._capa(att["col"], jetons, a_liberer)
             self.attente = None
             return res
+        if att["type"] == "suite":
+            self.attente = None
+            return self._handle(att["prefixe"] + " " + texte.strip(), a_liberer)
         self.attente = None
         return [msg("Saisie annulée.")]
 
