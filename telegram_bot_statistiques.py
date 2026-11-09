@@ -6,7 +6,8 @@
 #  - Données : un message texte (une série par colonne, noms de colonnes en première
 #    ligne) ou un fichier joint (csv, txt, tsv, dat, xlsx) — saisie possible depuis le S23
 #  - Analyses : descriptif, normalité, tests t, Z, F, Poisson, ANOVA, khi², estimation, identification de loi, corrélation,
-#    régression, séries, cartes de contrôle (dont p et u, avant/après), graphiques, capabilité, Kappa, génération de données ;
+#    régression, séries, cartes de contrôle (dont p, np, c et u, avant/après), graphiques, capabilité, R&R (croisée, emboîtée, type 1),
+#    ANOVA à deux facteurs, Kappa, génération de données, analyse par groupe ;
 #    menus à boutons, résultats en texte à chasse fixe + graphiques en images
 #  - Les données d'une conversation restent en mémoire du bot (rien n'est écrit sur disque)
 #
@@ -52,6 +53,8 @@ COMMANDES_MENU = [
     ("normalite", "Test de normalité (Shapiro-Wilk)"),
     ("t", "Test t (1 ou 2 échantillons, apparié)"),
     ("anova", "ANOVA à un facteur (+ Tukey)"),
+    ("anova2", "ANOVA à deux facteurs"),
+    ("rr", "R&R : croisée, emboîtée, type 1"),
     ("capa", "Capabilité (Pp/Ppk, Cp/Cpk)"),
     ("kappa", "Kappa de Cohen"),
     ("f", "Test F de comparaison de deux variances"),
@@ -64,10 +67,11 @@ COMMANDES_MENU = [
     ("serie", "Série chronologique et tendances"),
     ("khi2", "Test du khi² d'indépendance"),
     ("carte", "Carte de contrôle (X-barre, I-MR, avant/après)"),
-    ("cartep", "Cartes p et u (attributs)"),
+    ("cartep", "Cartes p, np, c et u (attributs)"),
     ("graphique", "Graphiques"),
     ("generer", "Générer des données aléatoires"),
     ("illustration", "Illustrations de référence"),
+    ("vocabulaire", "Vocabulaire : définition d'un terme"),
     ("groupe", "Analyser par groupe (colonne de groupes)"),
     ("alpha", "Risque α des tests"),
     ("lecture", "Options de lecture (séparateur, décimale)"),
@@ -84,6 +88,7 @@ LIMITE_MESSAGE = 3600
 BTN_MENU = [[("📈 Descriptif", "/descriptif"), ("🔔 Normalité", "/normalite")],
             [("⚖️ Test t", "/t"), ("🧪 ANOVA", "/anova")],
             [("🎯 Capabilité", "/capa"), ("🤝 Kappa", "/kappa")],
+            [("📐 R&R", "/rr"), ("🧮 ANOVA 2 facteurs", "/anova2")],
             [("🔬 Test Z", "/z"), ("📐 Estimation", "/estimation")],
             [("🔎 Identif. de loi", "/identification"), ("🔗 Corrélation", "/correlation")],
             [("📉 Régression", "/regression"), ("⏳ Série chrono.", "/serie")],
@@ -317,11 +322,11 @@ class Session:
         table = {"/start": self.c_start, "/aide": self.c_aide, "/help": self.c_aide, "/donnees": self.c_donnees,
                  "/etat": self.c_etat, "/effacer": self.c_effacer, "/annuler": self.c_annuler, "/export": self.c_export,
                  "/lecture": self.c_lecture, "/descriptif": self.c_descriptif, "/normalite": self.c_normalite,
-                 "/t": self.c_t, "/anova": self.c_anova, "/capa": self.c_capa, "/kappa": self.c_kappa,
+                 "/t": self.c_t, "/anova": self.c_anova, "/anova2": self.c_anova2, "/rr": self.c_rr, "/capa": self.c_capa, "/kappa": self.c_kappa,
                  "/f": self.c_f, "/z": self.c_z, "/poisson": self.c_poisson, "/estimation": self.c_estimation,
                  "/identification": self.c_identification, "/correlation": self.c_correlation, "/regression": self.c_regression,
                  "/serie": self.c_serie, "/khi2": self.c_khi2, "/carte": self.c_carte, "/cartep": self.c_cartep,
-                 "/graphique": self.c_graphique, "/generer": self.c_generer, "/illustration": self.c_illustration, "/alpha": self.c_alpha, "/groupe": self.c_groupe}
+                 "/graphique": self.c_graphique, "/generer": self.c_generer, "/illustration": self.c_illustration, "/vocabulaire": self.c_vocabulaire, "/alpha": self.c_alpha, "/groupe": self.c_groupe}
         f = table.get(cmd)
         if f is None:
             return [msg("Commande inconnue. /aide pour la liste.")]
@@ -354,6 +359,8 @@ class Session:
             "/descriptif\n/normalite [colonne]\n"
             "/t [X] [Y|0] [welch|apparie|egales] [sup|inf] [mu=valeur]\n"
             "/anova [colonnes | mesures groupes]\n"
+            "/anova2 [mesures facteurA facteurB] [interaction=non]\n"
+            "/rr croisee|emboitee [pièces opérateurs mesures] [tol=…] [l=6] [alpha=0,05]   ou   /rr type1 mesures ref=… tol=… [k=20] [l=6]\n"
             "/capa [colonne] [LSL] [USL] [cible] [σ intra]  (« - » pour une valeur absente)\n"
             "/kappa [évaluation 1] [évaluation 2]\n"
             "/f [X] [Y] [sup|inf]\n"
@@ -366,11 +373,12 @@ class Session:
             "/serie Y [ordre=colonne] [modeles=lineaire,quadratique,exponentielle,logistique] [horizon=n]\n"
             "/khi2 A B  (indépendance, données brutes)\n"
             "/carte colonnes [type=imr|xbar_r|xbar_s] [ordre=col] [phase=col] [rupture=n]\n"
-            "/cartep p|u comptages [effectifs] [n=…] [ordre=col] [phase=col] [rupture=n]\n"
+            "/cartep p|np|c|u comptages [effectifs] [n=…] [ordre=col] [phase=col] [rupture=n]   (carte c : sans effectif)\n"
             "/graphique type colonnes   (histogramme, secteurs, barres, bulles, nuage, individuelles, intervalles, boite, probabilite)\n"
             "/generer loi [paramètres] [n=30] [dec=3] [graine=…] [nom=…] [remplace]\n"
             "/groupe [colonne] [jour|mois|annee] [valeurs=a|b]   (aucun : analyse de l'ensemble) — toutes les analyses sont alors lancées groupe par groupe\n"
             "/illustration [sujet]   ·   /alpha [valeur]\n"
+            "/vocabulaire [mot]   (définition d'un terme ; sans argument : la liste)\n"
             "Les colonnes se désignent par leur numéro (voir /etat) ou leur nom.\n\n"
             "Autres\n/etat · /export · /effacer · /annuler\n\n"
             "Les données ne sont conservées qu'en mémoire du bot, le temps de la conversation.", BTN_MENU)]
@@ -506,6 +514,58 @@ class Session:
         if len(num) >= 2:
             b.append([("Chaque colonne numérique = un groupe", "/anova colonnes")])
         return [msg("ANOVA : quelle organisation des données ?", b, remplace=True)]
+
+    def c_anova2(self, args, a_liberer):
+        self.donnees()
+        libres, kv = self._kv(args)
+        suffixe = " interaction=non" if kv.get("interaction", "").lower() in ("non", "0", "false", "faux") else ""
+        pref = "/anova2" + suffixe
+        if not libres:
+            return self._choisir_col(pref, "ANOVA à deux facteurs : colonne des mesures ? (option : interaction=non)")
+        y = self.colonne(libres[0])
+        if len(libres) == 1:
+            return self._choisir_col(f"{pref} {self.index(y)}", f"Mesures : {y}. Facteur A ?", "tout", exclure=(y,))
+        a = self.colonne(libres[1], "tout")
+        if len(libres) == 2:
+            return self._choisir_col(f"{pref} {self.index(y)} {self.index(a)}", f"Facteur A : {a}. Facteur B ?", "tout", exclure=(y, a))
+        b = self.colonne(libres[2], "tout")
+        return self._res(self.etude.commande("anova2", {"valeur": y, "facteur_a": a, "facteur_b": b, "interaction": not suffixe}), a_liberer)
+
+    def c_rr(self, args, a_liberer):
+        self.donnees()
+        libres, kv = self._kv(args)
+        mode = libres[0].lower().replace("é", "e").replace("î", "i") if libres else ""
+        mode = {"croisee": "croisee", "emboitee": "emboitee", "type1": "type1", "1": "type1"}.get(mode)
+        if mode is None:
+            b = [[("R&R croisée", "/rr croisee")], [("R&R emboîtée", "/rr emboitee")], [("R&R de type 1 (un étalon)", "/rr type1")]]
+            return [msg("R&R : quel type d'étude ?\n• croisée : chaque opérateur mesure toutes les pièces\n"
+                        "• emboîtée : chaque pièce n'est mesurée que par un seul opérateur (essai destructif)\n"
+                        "• type 1 : une pièce étalon mesurée de nombreuses fois", b, remplace=True)]
+        reste = libres[1:]
+        options = "".join(f" {k}={v}" for k, v in kv.items())          # les options (tol, l, alpha…) suivent les boutons
+        pref = f"/rr {mode}{options}"
+        if mode == "type1":
+            if not reste:
+                return self._choisir_col(pref, "R&R de type 1 : colonne des mesures répétées de l'étalon ? (options : ref=…, tol=…, k=20, l=6)")
+            col = self.colonne(reste[0])
+            ref, tol = self._nombre(kv, "ref", "la valeur de référence"), self._nombre(kv, "tol", "la tolérance")
+            if ref is None or tol is None:
+                return self._suite(f"/rr type1 {self.index(col)}", f"R&R de type 1 sur « {col} » : envoyez ref=<valeur de référence de l'étalon> tol=<tolérance> [k=20] [l=6].")
+            return self._res(self.etude.commande("rr1", {"colonne": col, "reference": ref, "tolerance": tol,
+                                                         "k": self._nombre(kv, "k", "K"), "l": self._nombre(kv, "l", "L")}), a_liberer)
+        if not reste:
+            return self._choisir_col(pref, f"R&R {'croisée' if mode == 'croisee' else 'emboîtée'} : colonne des pièces ? (options : tol=…, l=6" + (", alpha=0,05)" if mode == "croisee" else ")"), "tout")
+        piece = self.colonne(reste[0], "tout")
+        if len(reste) == 1:
+            return self._choisir_col(f"{pref} {self.index(piece)}", f"Pièces : {piece}. Colonne des opérateurs ?", "tout", exclure=(piece,))
+        oper = self.colonne(reste[1], "tout")
+        if len(reste) == 2:
+            return self._choisir_col(f"{pref} {self.index(piece)} {self.index(oper)}", f"Opérateurs : {oper}. Colonne des mesures ?", exclure=(piece, oper))
+        params = {"piece": piece, "operateur": oper, "mesure": self.colonne(reste[2]),
+                  "tolerance": self._nombre(kv, "tol", "la tolérance"), "l": self._nombre(kv, "l", "L")}
+        if mode == "croisee":
+            params["alpha"] = self._nombre(kv, "alpha", "le seuil de l'interaction")
+        return self._res(self.etude.commande("rr_croisee" if mode == "croisee" else "rr_emboitee", params), a_liberer)
 
     def c_capa(self, args, a_liberer):
         if not args:
@@ -753,12 +813,17 @@ class Session:
     def c_cartep(self, args, a_liberer):
         self.donnees()
         libres, kv = self._kv(args)
-        if not libres or libres[0].lower() not in ("p", "u"):
-            return [msg("Cartes d'attributs : /cartep p|u comptages [effectifs] [n=effectif constant] [ordre=col] [phase=col] [rupture=n]\n"
-                        "p : unités défectueuses ; u : défauts par unité.", [[("Carte p", "/cartep p"), ("Carte u", "/cartep u")]])]
+        if not libres or libres[0].lower() not in ("p", "np", "c", "u"):
+            return [msg("Cartes d'attributs : /cartep p|np|c|u comptages [effectifs] [n=effectif constant] [ordre=col] [phase=col] [rupture=n]\n"
+                        "p : proportion d'unités défectueuses ; np : nombre d'unités défectueuses (effectif constant) ; "
+                        "c : nombre de défauts par unité de contrôle de taille constante (sans effectif) ; u : défauts par unité.",
+                        [[("Carte p", "/cartep p"), ("Carte np", "/cartep np")], [("Carte c", "/cartep c"), ("Carte u", "/cartep u")]], remplace=True)]
+        type_ = libres[0].lower()
         if len(libres) == 1:
-            return self._choisir_col(f"/cartep {libres[0].lower()}", "Quelle colonne de comptages ? (puis ajoutez la colonne d'effectifs ou n=…)")
-        p = {"type": libres[0].lower(), "defauts": self.colonne(libres[1]), "effectif": self.colonne(libres[2]) if len(libres) > 2 else None,
+            suite = "(puis n=… ou la colonne d'effectifs)" if type_ != "c" else "(carte c : aucun effectif à fournir)"
+            return self._choisir_col(f"/cartep {type_}", f"Quelle colonne de comptages ? {suite}")
+        p = {"type": type_, "defauts": self.colonne(libres[1]),
+             "effectif": self.colonne(libres[2]) if len(libres) > 2 and type_ != "c" else None,
              "n": self._nombre(kv, "n", "l'effectif constant"), "ordre": self._facultative(kv, "ordre"), "phase": self._facultative(kv, "phase"),
              "rupture": self._nombre(kv, "rupture", "le numéro de point"), "tests": [1, 2, 3, 4]}
         return self._res(self.etude.commande("carte_attributs", p), a_liberer)
@@ -837,6 +902,37 @@ class Session:
         if not images:
             return [msg(f"Aucune image pour « {sujets[args[0]]} ».")]
         return [msg(f"🖼 {sujets[args[0]]}")] + [{"photo": f} for f in images]
+
+    def c_vocabulaire(self, args, a_liberer):
+        termes = st.lire_vocabulaire()
+        if not termes:
+            return [msg("Le vocabulaire est vide : le fichier « vocabulaire.txt » est absent du dossier du programme.")]
+        requete = " ".join(args).strip()
+        if not requete:
+            lettres = sorted({st.cle_tri_texte(t)[:1].upper() for t, _ in termes if st.cle_tri_texte(t)[:1].isalpha()})
+            b = [[(l, f"/vocabulaire ={l}") for l in lettres[i:i + 6]] for i in range(0, len(lettres), 6)]
+            return [msg(f"Vocabulaire : {len(termes)} terme(s). Envoyez /vocabulaire <mot> (par exemple /vocabulaire capabilité), ou choisissez une initiale.", b, remplace=True)]
+        if requete.startswith("="):                                    # liste des termes d'une initiale
+            ini = st.cle_tri_texte(requete[1:2])
+            trouves = [e for e in termes if st.cle_tri_texte(e[0]).startswith(ini)]
+            exact = None
+        else:
+            trouves = st.chercher_vocabulaire(termes, requete)
+            q = st.cle_tri_texte(requete)
+            exact = next((e for e in trouves if st.cle_tri_texte(e[0]) == q), None)
+        if not trouves:
+            return [msg(f"Aucun terme ne correspond à « {requete} ». /vocabulaire pour la liste.")]
+        if exact or len(trouves) == 1:
+            t, d = exact or trouves[0]
+            return [msg(f"📖 {t}\n\n{d}", BTN_MENU)]
+        boutons = []
+        for t, _ in trouves[:16]:
+            cmd = "/vocabulaire " + t
+            while len(cmd.encode("utf-8")) > 60:
+                cmd = cmd[:-1]
+            boutons.append([(t[:40], cmd)])
+        plus = f" (16 premiers sur {len(trouves)} : préciser le mot)" if len(trouves) > 16 else ""
+        return [msg(f"{len(trouves)} terme(s) trouvé(s){plus} :", boutons, remplace=True)]
 
     # -- analyse par groupe ---------------------------------------------------------------------
     def resume_groupe(self):
