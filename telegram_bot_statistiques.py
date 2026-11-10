@@ -60,6 +60,7 @@ COMMANDES_MENU = [
     ("f", "Test F de comparaison de deux variances"),
     ("z", "Test Z (écart-type connu)"),
     ("poisson", "Test de Poisson (1 ou 2 échantillons)"),
+    ("puissance", "Puissance et taille d'échantillon (courbe de puissance)"),
     ("estimation", "Estimation d'une moyenne (intervalle de confiance)"),
     ("identification", "Identification de loi"),
     ("correlation", "Corrélation"),
@@ -323,7 +324,7 @@ class Session:
                  "/etat": self.c_etat, "/effacer": self.c_effacer, "/annuler": self.c_annuler, "/export": self.c_export,
                  "/lecture": self.c_lecture, "/descriptif": self.c_descriptif, "/normalite": self.c_normalite,
                  "/t": self.c_t, "/anova": self.c_anova, "/anova2": self.c_anova2, "/rr": self.c_rr, "/capa": self.c_capa, "/kappa": self.c_kappa,
-                 "/f": self.c_f, "/z": self.c_z, "/poisson": self.c_poisson, "/estimation": self.c_estimation,
+                 "/f": self.c_f, "/z": self.c_z, "/poisson": self.c_poisson, "/puissance": self.c_puissance, "/estimation": self.c_estimation,
                  "/identification": self.c_identification, "/correlation": self.c_correlation, "/regression": self.c_regression,
                  "/serie": self.c_serie, "/khi2": self.c_khi2, "/carte": self.c_carte, "/cartep": self.c_cartep,
                  "/graphique": self.c_graphique, "/generer": self.c_generer, "/illustration": self.c_illustration, "/vocabulaire": self.c_vocabulaire, "/alpha": self.c_alpha, "/groupe": self.c_groupe}
@@ -365,6 +366,7 @@ class Session:
             "/kappa [évaluation 1] [évaluation 2]\n"
             "/f [X] [Y] [sup|inf]\n"
             "/z [X] σ [mu=…] [sup|inf]   ou   /z X Y σX σY [mu=…]\n"
+            "/puissance t1|tpaire|t2|z1|p1|p2|anova [sup|inf] [n=…] [diff=…] [puissance=…] [sd=…] [p0=…] [k=…] [courbe=10,20,40]   (laisser vide une des trois grandeurs n, diff, puissance : elle est calculée)\n"
             "/poisson X Y [ratio=…]   ou   /poisson X lambda0=… [duree=…]   ou   /poisson total=… duree=… lambda0=…\n"
             "/estimation [X] [niveau=95] [inf|sup] [marge=…] [sigma=…]   ou   /estimation n=… moyenne=… s=…\n"
             "/identification [colonnes] [lois=normale,gamma,…] [sim=200]\n"
@@ -681,6 +683,23 @@ class Session:
         else:
             raise st.ErreurStat("Syntaxe : /z X σ [mu=…]   ou   /z X Y σX σY [mu=…].")
         return self._res(self.etude.commande("z", params), a_liberer)
+
+    TESTS_PUISSANCE = ("t1", "tpaire", "t2", "z1", "p1", "p2", "anova")
+
+    def c_puissance(self, args, a_liberer):
+        libres, kv = self._kv(args)
+        libres, alt = self._alt(libres)
+        if not libres or libres[0].lower() not in self.TESTS_PUISSANCE:
+            return self._suite("/puissance", "Puissance et taille d'échantillon. Envoyez : test [sup|inf] n=… diff=… puissance=… sd=… (laisser vide une des trois grandeurs n, diff, puissance : elle est calculée).\n"
+                                             "Tests : t1 (t à 1 échantillon), tpaire, t2 (2 échantillons), z1 (σ connu), p1 (1 proportion, binomiale exacte), p2 (2 proportions), anova (ajouter k=niveaux).\n"
+                                             "Proportions : p0=proportion de référence, diff = proportion réelle − p0. Facultatif : courbe=10,20,40 (tailles tracées).\n"
+                                             "Exemple : t2 diff=1 puissance=0,9 sd=1,5")
+        n = lambda c, nom: self._nombre(kv, c, nom)
+        p = {"test": libres[0].lower(), "alternative": alt, "n": n("n", "la taille d'échantillon"),
+             "difference": n("diff", "la différence"), "puissance": n("puissance", "la puissance"),
+             "ecart_type": n("sd", "l'écart-type"), "p0": n("p0", "la proportion de référence"),
+             "k": n("k", "le nombre de niveaux") or 3, "n_courbe": kv.get("courbe", "")}
+        return self._res(self.etude.commande_libre("puissance", p), a_liberer)
 
     def c_poisson(self, args, a_liberer):
         libres, kv = self._kv(args)

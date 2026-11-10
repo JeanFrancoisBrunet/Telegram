@@ -1,61 +1,138 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # =============================================================================
-#  Bot Telegram « DoE » — interface Telegram de Design of Experiments.
-#  Auteur : Jean-François BRUNET – JFBConseils – Octobre 2026
+#  Bot Telegram « DOE » — interface Telegram de DOE (plans d'expériences).
+#  Importe doe.py (même cœur que l'application de bureau ; calculs réalisés par R).
+#  - Plans : criblage, factoriel (complet / fractionnaire), Taguchi, surface de réponse, mélange
+#  - Phases : définition des facteurs et génération de la matrice → saisie des réponses →
+#    analyse (ANOVA, effets, graphiques) → graphiques du modèle → prévision → optimisation
+#  - Menus à boutons, résultats en texte à chasse fixe + graphiques en images
+#  - Les plans d'une conversation restent en mémoire du bot (rien n'est écrit sur disque)
+#
+#  Configuration (aucun secret dans ce fichier) :
+#    Token   : variable TELEGRAM_TOKEN, sinon ~/.telegram_config  [telegram] token_doe
+#    Accès   : ALLOWED_IDS (variable ou .env, séparés par des virgules) ou
+#              ~/.telegram_config  [telegram] allowed_ids ; le chat_id du fichier est toujours
+#              autorisé. Si aucun identifiant n'est connu, le bot est ouvert à tous (déconseillé).
+#    Un utilisateur refusé reçoit son identifiant Telegram, à ajouter à ALLOWED_IDS.
+#  Dépendance : requests (+ R et r-cran-jsonlite pour les calculs)
+#  Lancement  : python3 telegram_bot_doe.py
+#  Service    : voir la fiche « Bot Telegram » (systemd, ...)
+#  Auteur : Jean-François BRUNET – JFBConseils – Novembre 2026
 #  Rev.   :
 # =============================================================================
 
 import atexit
+import configparser
 import html
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
 import time
-import subprocess
-import configparser
 from datetime import datetime
 from pathlib import Path
 
 import requests
 
 try:
-    import statistiques as st
+    import doe
 except ImportError:
-    sys.path.insert(0, str(Path.home() / "Projects" / "Statistiques"))
-    import statistiques as st
+    sys.path.insert(0, str(Path.home() / "Projects" / "DOE"))
+    import doe
 
 COMMANDES_MENU = [
-    ("donnees", "Charger des données (texte ou fichier)"),
-    ("etat", "Données chargées : colonnes et effectifs"),
-    ("descriptif", "Statistiques descriptives"),
-    ("normalite", "Test de normalité (Shapiro-Wilk)"),
-    ("t", "Test t (1 ou 2 échantillons, apparié)"),
-    ("anova", "ANOVA à un facteur (+ Tukey)"),
-    ("capa", "Capabilité (Pp/Ppk, Cp/Cpk)"),
-    ("kappa", "Kappa de Cohen"),
-    ("lecture", "Options de lecture (séparateur, décimale)"),
-    ("export", "Récupérer les données en CSV"),
-    ("effacer", "Effacer les données"),
+    ("criblage", "Plan de criblage (Plackett-Burman, fractions)"),
+    ("factoriel", "Plan factoriel complet ou fractionnaire"),
+    ("taguchi", "Plan de Taguchi (tableaux orthogonaux)"),
+    ("surface", "Plan de surface de réponse"),
+    ("melange", "Plan de mélange"),
+    ("famille", "Changer de plan actif"),
+    ("plan", "Afficher le plan actif"),
+    ("reponses", "Saisir les réponses mesurées"),
+    ("analyse", "Analyser les résultats"),
+    ("graphiques", "Graphiques du modèle (surface, mélange)"),
+    ("prevoir", "Prévision avec intervalles"),
+    ("optimiser", "Optimiser les réponses"),
+    ("alpha", "Risque α"),
+    ("export", "Récupérer le plan en CSV"),
+    ("etat", "État du travail en cours"),
+    ("effacer", "Effacer le plan actif"),
     ("annuler", "Annuler la saisie en attente"),
     ("aide", "Aide"),
 ]
 
-EXTENSIONS = {".csv", ".txt", ".tsv", ".dat", ".xlsx"}
 LARGEUR_MOBILE = 42          # au-delà, les tableaux sont présentés en fiches
 LIMITE_MESSAGE = 3600
+MAX_FICHIER = 5 * 1024 * 1024
+FAMILLES = doe.FAMILLES
+NOMS_FAMILLES = {c: v["titre"][3:] for c, v in FAMILLES.items()}
 
-BTN_MENU = [[("📈 Descriptif", "/descriptif"), ("🔔 Normalité", "/normalite")],
-            [("⚖️ Test t", "/t"), ("🧪 ANOVA", "/anova")],
-            [("🎯 Capabilité", "/capa"), ("🤝 Kappa", "/kappa")],
-            [("📤 Export CSV", "/export"), ("📋 Données", "/etat")]]
+BTN_MENU = [[("🔎 Criblage", "/criblage"), ("🧊 Factoriel", "/factoriel")],
+            [("🧩 Taguchi", "/taguchi"), ("⛰ Surface", "/surface")],
+            [("🧪 Mélange", "/melange"), ("📋 Plan actif", "/plan")],
+            [("✍️ Réponses", "/reponses"), ("📊 Analyse", "/analyse")],
+            [("🗺 Graphiques", "/graphiques"), ("🎯 Prévision", "/prevoir")],
+            [("🏁 Optimiser", "/optimiser"), ("📤 Export CSV", "/export")]]
+
+# Syntaxe de définition d'un plan, affichée par chaque commande de création
+AIDE_PLAN = {
+    "criblage": (
+        "🔎 Plan de criblage\n\n"
+        "Envoyez un facteur par ligne :\n"
+        "  Nom : niveau_bas niveau_haut\n"
+        "(deux niveaux qualitatifs : mots à la place des nombres)\n\n"
+        "Options (ligne ou fin de message) :\n"
+        "• methode=pb | fraction   (défaut : pb = Plackett-Burman)\n"
+        "• essais=12   (pb : 8, 12, 16, 20, 24 ou 32 ; défaut automatique)\n"
+        "• fraction=1   (numéro proposé pour ce nombre de facteurs) ou gen=D=AB,E=AC\n"
+        "• rep=1  centres=0  alea=oui|non  graine=42"),
+    "factoriel": (
+        "🧊 Plan factoriel\n\n"
+        "Envoyez un facteur par ligne :\n"
+        "  Nom : niveau_bas niveau_haut\n"
+        "(deux niveaux qualitatifs : mots à la place des nombres)\n\n"
+        "Options (ligne ou fin de message) :\n"
+        "• type=complet | fractionnaire   (défaut : complet)\n"
+        "• fraction=1   (numéro proposé pour ce nombre de facteurs) ou gen=D=ABC\n"
+        "• rep=1  centres=0  alea=oui|non  graine=42"),
+    "taguchi": (
+        "🧩 Plan de Taguchi\n\n"
+        "Envoyez un facteur par ligne, avec ses niveaux séparés par des points-virgules (2, 3 ou 5 niveaux) :\n"
+        "  Nom : niveau1 ; niveau2 ; niveau3\n\n"
+        "Options (ligne ou fin de message) :\n"
+        "• tableau=L9   (défaut : automatique ; L4 L8 L9 L12 L16 L18 L25 L27 L32)\n"
+        "• interactions=A*B,C*D   (par lettres des facteurs)\n"
+        "• reponses=3   (colonnes de réponses : répétitions ou conditions de bruit ; défaut 1)\n"
+        "• alea=oui|non  graine=42"),
+    "surface": (
+        "⛰ Plan de surface de réponse\n\n"
+        "Envoyez un facteur quantitatif par ligne :\n"
+        "  Nom : niveau_bas niveau_haut\n\n"
+        "Options (ligne ou fin de message) :\n"
+        "• type=ccc | ccf | cci | bb   (défaut : ccc ; bb = Box-Behnken, 3 à 5 facteurs)\n"
+        "• alpha=rotatable | orthogonal | valeur   (ccc seulement)\n"
+        "• centres=…  rep=1  alea=oui|non  graine=42"),
+    "melange": (
+        "🧪 Plan de mélange\n\n"
+        "Envoyez un composant par ligne, avec ses bornes de proportion (0 à 1) :\n"
+        "  Nom : borne_basse borne_haute        (sans bornes : 0 et 1)\n\n"
+        "Options (ligne ou fin de message) :\n"
+        "• type=reseau | centroide | sommets   (défaut : reseau ; sommets si des bornes hautes contraignent)\n"
+        "• degre=2   (réseau)  aretes=oui  faces=oui  (sommets)  axiaux=oui\n"
+        "• centres=1  rep=1  alea=oui|non  graine=42"),
+}
+
+MODELES_COURTS = {c: [code for _, code in lst] for c, lst in doe.MODELES.items()}
+BUTS = {"max": "max", "maximiser": "max", "min": "min", "minimiser": "min", "cible": "cible"}
 
 
 # =============================================================================
-#  Utilitaires Telegram (même structure que le bot Problem Solving)
+#  Utilitaires Telegram (même structure que les autres bots)
 # =============================================================================
 def lire_config_telegram():
     cp = configparser.RawConfigParser()
@@ -134,358 +211,247 @@ def regrouper(blocs):
     return messages
 
 
-def items_resultat(res):
+ABREGES = {"Erreur_type": "ET", "Somme_carrés": "SC", "Carré_moyen": "CM", "p_value": "p", "Coefficient": "Coef", "Contribution_pct": "Contr.%",
+           "Contribution_pure_pct": "Contr.pure%", "Valeur_codée": "Codé", "Valeur_réelle": "Réel", "IC_inf": "IC inf", "IC_sup": "IC sup",
+           "Prévision": "Prév.", "Désirabilité": "Désir.", "Écart_type": "Écart-t.", "Ecart_type": "Écart-t."}
+
+
+def table_fiches(cols, rows, libre=False):
+    """Tableau trop large pour un mobile : une fiche compacte par ligne (1re colonne en titre)."""
+    ent = [ABREGES.get(c, str(c).replace("_", " ") if libre else doe.libelle(c)) for c in cols]
+    fiches = []
+    for r in rows:
+        cel = [doe.fmt_cellule(c, v, libre) for c, v in zip(cols, r)]
+        lignes, cur = [], ""
+        for e, c in zip(ent[1:], cel[1:]):
+            morceau = f"{e} {c}"
+            if cur and len(cur) + 3 + len(morceau) > 38:
+                lignes.append(cur)
+                cur = morceau
+            else:
+                cur = (cur + " · " + morceau) if cur else morceau
+        if cur:
+            lignes.append(cur)
+        fiches.append(f"{ent[0]} : {cel[0].strip()}\n" + "\n".join("  " + l for l in lignes))
+    return "\n".join(fiches)
+
+
+def items_resultat(res, menu=BTN_MENU):
     blocs = []
     if res.titre:
         blocs.append(f"📊 <b>{esc(res.titre)}</b>")
     if res.lignes:
         blocs.append(esc("\n".join(res.lignes)))
     for nom, (cols, rows) in res.tables.items():
-        large = st.table_texte(cols, rows, "large")
-        mode = "large" if max(len(l) for l in large.split("\n")) <= LARGEUR_MOBILE else "fiche"
-        corps = large if mode == "large" else st.table_texte(cols, rows, "fiche")
-        blocs.append(f"<b>{esc(st.libelle(nom))}</b>")
+        libre = nom in res.libres
+        large = doe.table_texte(cols, rows, libre=libre)
+        if max(len(l) for l in large.split("\n")) <= LARGEUR_MOBILE:
+            corps = large
+        else:
+            corps = table_fiches(cols, rows, libre)
+        blocs.append(f"<b>{esc(doe.libelle(nom))}</b>")
         blocs.extend(blocs_pre(corps))
     if res.avertissements:
         blocs.append("<i>" + esc("\n".join("Remarque : " + a for a in res.avertissements)) + "</i>")
     items = [msg(t, html_=True) for t in regrouper(blocs)]
     items += [{"photo": f} for f in res.figures]
-    items.append(msg("Autre analyse ?", BTN_MENU))
+    items.append(msg("Suite ?", menu))
     return items
 
 
+def lettre(i):
+    return doe.lettre(i) if hasattr(doe, "lettre") else chr(65 + i)
+
+
 # =============================================================================
-#  Session d'une conversation : données + commandes
+#  Lecture des définitions de plan
 # =============================================================================
-class Session:
-    def __init__(self):
-        self.etude = st.Etude()
-        self.attente = None                       # saisie en attente (valeur de référence, limites…)
-        self.lecture = {"sep": "auto", "dec": "auto", "entete": "auto"}
-        self.brut = None                          # ("texte", str) ou ("fichier", Path) pour relire avec d'autres options
+def booleen(v, nom):
+    t = v.strip().lower()
+    if t in ("oui", "o", "1", "vrai", "true", "yes"):
+        return True
+    if t in ("non", "n", "0", "faux", "false", "no"):
+        return False
+    raise doe.ErreurDOE(f"Option « {nom} » : répondre oui ou non.")
 
-    # -- données -------------------------------------------------------------------
-    def donnees(self):
-        if self.etude.donnees is None:
-            raise st.ErreurStat("Aucune donnée chargée. Envoyez un tableau en message texte (une série par colonne, "
-                                "noms de colonnes en première ligne) ou un fichier. /donnees pour le détail.")
-        return self.etude.donnees
 
-    def colonne(self, ref, kind="num"):
-        d = self.donnees()
-        ref = str(ref).strip()
-        if ref.isdigit():
-            i = int(ref) - 1
-            if not 0 <= i < len(d.noms):
-                raise st.ErreurStat(f"Numéro de colonne invalide : {ref} (voir /etat).")
-            nom = d.noms[i]
+def entier(v, nom, minimum=0):
+    x = doe.lire_nombre(v, nom)
+    if x is None or x != int(x) or x < minimum:
+        raise doe.ErreurDOE(f"Option « {nom} » : saisir un entier supérieur ou égal à {minimum}.")
+    return int(x)
+
+
+def decouper_definition(texte):
+    """Texte -> (lignes de facteurs, options clé->valeur). Une ligne « mot=valeur » sans « : » est une ligne d'options."""
+    facteurs, options = [], {}
+    for brut in texte.replace("\r", "").split("\n"):
+        ligne = brut.strip()
+        if not ligne:
+            continue
+        if ":" not in ligne and "=" in ligne:
+            for jeton in ligne.replace(";", " ").split():
+                if "=" not in jeton:
+                    raise doe.ErreurDOE(f"Option non reconnue : « {jeton} » (forme attendue : option=valeur).")
+                k, v = jeton.split("=", 1)
+                options[k.strip().lower()] = v.strip()
         else:
-            trouves = [n for n in d.noms if n.lower() == ref.lower()]
-            if not trouves:
-                raise st.ErreurStat(f"Colonne introuvable : « {ref} » (voir /etat).")
-            nom = trouves[0]
-        if kind == "num" and d.types[nom] != "num":
-            raise st.ErreurStat(f"La colonne « {nom} » n'est pas numérique.")
-        return nom
+            facteurs.append(ligne)
+    return facteurs, options
 
-    def index(self, nom):
-        return self.donnees().noms.index(nom) + 1
 
-    def boutons_colonnes(self, prefixe, kind="num", exclure=(), supplements=()):
-        d = self.donnees()
-        noms = [n for n in d.noms if (kind == "tout" or d.types[n] == kind) and n not in exclure]
-        if kind == "tout":
-            noms = sorted(noms, key=lambda n: d.types[n] == "num")     # colonnes texte d'abord
-        boutons, rang = [], []
-        for n in noms:
-            rang.append((f"{self.index(n)}. {n[:18]}", f"{prefixe} {self.index(n)}"))
-            if len(rang) == 2:
-                boutons.append(rang)
-                rang = []
-        if rang:
-            boutons.append(rang)
-        for lib, cmd in supplements:
-            boutons.append([(lib, cmd)])
-        return boutons, noms
-
-    def liste_colonnes(self):
-        d = self.donnees()
-        return "\n".join(f"{i}. {n} ({'numérique' if d.types[n] == 'num' else 'texte'})" for i, n in enumerate(d.noms, 1))
-
-    # -- chargement -------------------------------------------------------------------
-    def apres_chargement(self, origine):
-        d = self.donnees()
-        txt = f"✅ Données chargées ({origine}) : {d.resume()}\n\n{self.liste_colonnes()}"
-        if d.avertissements:
-            txt += "\n\n⚠️ " + "\n⚠️ ".join(d.avertissements)
-        txt += "\n\nLes numéros ci-dessus peuvent remplacer les noms dans les commandes."
-        return [msg(txt, BTN_MENU)]
-
-    def charger_texte(self, texte):
-        self.etude.charger_texte(texte, **self.lecture)
-        self.brut = ("texte", texte)
-        return self.apres_chargement("saisie")
-
-    def liberer_fichier(self):
-        """Supprime le dossier temporaire du fichier mémorisé pour relecture."""
-        if self.brut and self.brut[0] == "fichier":
-            import shutil
-            shutil.rmtree(self.brut[1].parent, ignore_errors=True)
-
-    def charger_fichier(self, chemin, nom):
-        self.etude.charger_fichier(chemin, **self.lecture)
-        if self.brut and self.brut[0] == "fichier" and self.brut[1] != Path(chemin):
-            self.liberer_fichier()
-        self.brut = ("fichier", Path(chemin))
-        return self.apres_chargement(nom)
-
-    # -- commandes ----------------------------------------------------------------------
-    def handle(self, texte):
-        """Retourne (items, résultats à libérer après envoi)."""
-        a_liberer = []
-        try:
-            return self._handle(texte, a_liberer), a_liberer
-        except st.ErreurStat as e:
-            return [msg("⚠️ " + str(e))], a_liberer
-
-    def _res(self, res, a_liberer):
-        a_liberer.append(res)
-        return items_resultat(res)
-
-    def _handle(self, texte, a_liberer):
-        texte = texte.strip()
-        if not texte.startswith("/"):
-            return self.texte_libre(texte, a_liberer)
-        parts = texte.split()
-        cmd = parts[0].lower().split("@")[0]
-        args = parts[1:]
-        if cmd not in ("/annuler",):
-            self.attente = None if cmd != "/lecture" else self.attente
-        table = {"/start": self.c_start, "/aide": self.c_aide, "/help": self.c_aide, "/donnees": self.c_donnees,
-                 "/etat": self.c_etat, "/effacer": self.c_effacer, "/annuler": self.c_annuler, "/export": self.c_export,
-                 "/lecture": self.c_lecture, "/descriptif": self.c_descriptif, "/normalite": self.c_normalite,
-                 "/t": self.c_t, "/anova": self.c_anova, "/capa": self.c_capa, "/kappa": self.c_kappa}
-        f = table.get(cmd)
-        if f is None:
-            return [msg("Commande inconnue. /aide pour la liste.")]
-        return f(args, a_liberer)
-
-    def texte_libre(self, texte, a_liberer):
-        if self.attente:
-            return self.reponse_attendue(texte, a_liberer)
-        try:
-            return self.charger_texte(texte)
-        except st.ErreurStat as e:
-            return [msg(f"⚠️ {e}\n\nEnvoyez des données (une série par colonne, noms de colonnes en première ligne) "
-                        f"ou un fichier. /aide pour le détail.")]
-
-    # -- aide -----------------------------------------------------------------------------
-    def c_start(self, args, a_liberer):
-        return [msg("📊 Statistiques\n\nEnvoyez vos données en message texte ou en fichier joint "
-                    "(csv, txt, tsv, dat, xlsx), puis choisissez une analyse. /aide pour le détail.", BTN_MENU)]
-
-    def c_aide(self, args, a_liberer):
-        return [msg(
-            "📊 Statistiques — aide\n\n"
-            "Données\n"
-            "• Message texte : une série par colonne, noms de colonnes en 1ère ligne.\n"
-            "• Séparateurs reconnus : tabulation, point-virgule, virgule, espace ; décimale point ou virgule.\n"
-            "• Fichier joint : csv, txt, tsv, dat, xlsx (20 Mo au maximum). Pour de gros volumes, préférer un fichier "
-            "(un message Telegram est limité à 4096 caractères).\n"
-            "• Chaque nouvel envoi remplace les données précédentes. /lecture permet de forcer séparateur, décimale, ligne de noms.\n\n"
-            "Analyses (boutons ou commandes)\n"
-            "/descriptif\n/normalite [colonne]\n"
-            "/t [X] [Y|0] [welch|apparie|egales] [sup|inf] [mu=valeur]\n"
-            "/anova [colonnes | mesures groupes]\n"
-            "/capa [colonne] [LSL] [USL] [cible] [σ intra]  (« - » pour une valeur absente)\n"
-            "/kappa [évaluation 1] [évaluation 2]\n"
-            "Les colonnes se désignent par leur numéro (voir /etat) ou leur nom.\n\n"
-            "Autres\n/etat · /export · /effacer · /annuler\n\n"
-            "Les données ne sont conservées qu'en mémoire du bot, le temps de la conversation.", BTN_MENU)]
-
-    def c_donnees(self, args, a_liberer):
-        return [msg("Pour charger des données :\n• collez-les dans un message (une série par colonne, noms de colonnes en première ligne) ;\n"
-                    "• ou joignez un fichier csv, txt, tsv, dat ou xlsx.\n\n"
-                    "Une analyse par groupes demande une colonne de mesures et une colonne de groupes.")]
-
-    def c_etat(self, args, a_liberer):
-        d = self.donnees()
-        t = f"{d.resume()}\n\n{self.liste_colonnes()}"
-        o = self.lecture
-        if o != {"sep": "auto", "dec": "auto", "entete": "auto"}:
-            t += f"\n\nOptions de lecture : séparateur {o['sep']!r}, décimale {o['dec']!r}, noms de colonnes {o['entete']}."
-        return [msg(t, BTN_MENU)]
-
-    def c_effacer(self, args, a_liberer):
-        self.etude.donnees = None
-        self.liberer_fichier()
-        self.brut = None
-        return [msg("🗑 Données effacées.")]
-
-    def c_annuler(self, args, a_liberer):
-        self.attente = None
-        return [msg("Saisie annulée.", BTN_MENU)]
-
-    def c_export(self, args, a_liberer):
-        d = self.donnees()
-        dossier = Path(tempfile.mkdtemp(prefix="stat_export_"))
-        chemin = dossier / f"donnees_{datetime.now():%Y%m%d_%H%M}.csv"
-        chemin.write_text(d.vers_csv_texte(), encoding="utf-8-sig")
-        a_liberer.append(_Fichier(dossier))
-        return [{"document": chemin}]
-
-    def c_lecture(self, args, a_liberer):
-        if not args:
-            o = self.lecture
-            return [msg("Options de lecture actuelles :\n"
-                        f"• séparateur : {o['sep']!r}\n• décimale : {o['dec']!r}\n• ligne de noms de colonnes : {o['entete']}\n\n"
-                        "Modifier : /lecture sep=<tab|;|,|espace|auto> dec=<point|virgule|auto> entete=<oui|non|auto>\n"
-                        "Réinitialiser : /lecture auto\nLes données déjà reçues sont relues avec les nouvelles options.")]
-        corresp = {"sep": {"tab": "\t", "tabulation": "\t", ";": ";", "pointvirgule": ";", ",": ",", "virgule": ",",
-                           "espace": " ", "auto": "auto"},
-                   "dec": {"point": ".", ".": ".", "virgule": ",", ",": ",", "auto": "auto"},
-                   "entete": {"oui": True, "non": False, "auto": "auto"}}
-        if args == ["auto"]:
-            self.lecture = {"sep": "auto", "dec": "auto", "entete": "auto"}
+def lire_facteurs(famille, lignes):
+    res, vus = [], set()
+    for ligne in lignes:
+        if ":" in ligne:
+            nom, reste = ligne.split(":", 1)
         else:
-            for a in args:
-                if "=" not in a:
-                    raise st.ErreurStat("Syntaxe : /lecture sep=… dec=… entete=… (voir /lecture).")
-                k, v = a.split("=", 1)
-                k, v = k.lower(), v.lower()
-                if k not in corresp or v not in corresp[k]:
-                    raise st.ErreurStat(f"Option non reconnue : {a}")
-                self.lecture[k] = corresp[k][v]
-        if self.brut is None:
-            return [msg("Options enregistrées ; elles s'appliqueront aux prochaines données.")]
-        if self.brut[0] == "texte":
-            return self.charger_texte(self.brut[1])
-        return self.charger_fichier(self.brut[1], self.brut[1].name)
+            jetons = ligne.split()
+            nom, reste = jetons[0], " ".join(jetons[1:])
+        nom = nom.strip()
+        reste = reste.strip()
+        if not nom:
+            raise doe.ErreurDOE(f"Nom de facteur manquant dans « {ligne} ».")
+        if nom in vus:
+            raise doe.ErreurDOE(f"Le nom « {nom} » est utilisé plusieurs fois.")
+        if nom.lower() in doe.RESERVES or any(ch in nom for ch in '",;\n\t'):
+            raise doe.ErreurDOE(f"Le nom « {nom} » n'est pas permis (nom réservé, virgule, point-virgule ou guillemet).")
+        vus.add(nom)
+        if famille == "taguchi":
+            niv = [x.strip() for x in (reste.split(";") if ";" in reste else reste.split()) if x.strip()]
+            if len(niv) < 2:
+                raise doe.ErreurDOE(f"« {nom} » : saisir au moins deux niveaux, séparés par des points-virgules.")
+            if len(niv) == 4 or len(niv) > 5:
+                raise doe.ErreurDOE(f"« {nom} » : 2, 3 ou 5 niveaux sont pris en charge.")
+            if len(set(niv)) != len(niv):
+                raise doe.ErreurDOE(f"« {nom} » : les niveaux doivent être différents.")
+            res.append({"nom": nom, "niveaux": niv})
+            continue
+        jetons = reste.replace(";", " ").split()
+        if famille == "melange":
+            if not jetons:
+                jetons = ["0", "1"]
+            if len(jetons) != 2:
+                raise doe.ErreurDOE(f"« {nom} » : saisir la borne basse et la borne haute.")
+            lo, hi = doe.lire_nombre(jetons[0], f"la borne basse de « {nom} »"), doe.lire_nombre(jetons[1], f"la borne haute de « {nom} »")
+            if lo < 0 or hi > 1 or lo > hi:
+                raise doe.ErreurDOE(f"« {nom} » : les bornes doivent vérifier 0 ≤ borne basse ≤ borne haute ≤ 1.")
+            res.append({"nom": nom, "bas": lo, "haut": hi})
+            continue
+        if len(jetons) != 2:
+            raise doe.ErreurDOE(f"« {nom} » : saisir le niveau bas et le niveau haut (forme : Nom : bas haut).")
+        a, b = jetons
+        if doe.est_nombre(a) and doe.est_nombre(b):
+            lo, hi = doe.lire_nombre(a), doe.lire_nombre(b)
+            if lo >= hi:
+                raise doe.ErreurDOE(f"« {nom} » : le niveau bas doit être inférieur au niveau haut.")
+            res.append({"nom": nom, "type": "num", "bas": lo, "haut": hi})
+        else:
+            if famille == "surface":
+                raise doe.ErreurDOE(f"« {nom} » : un plan de surface exige des facteurs quantitatifs (niveaux numériques).")
+            if a == b:
+                raise doe.ErreurDOE(f"« {nom} » : les deux niveaux doivent être différents.")
+            res.append({"nom": nom, "type": "cat", "niveaux": [a, b]})
+    return res
 
-    # -- analyses -----------------------------------------------------------------------------
-    def c_descriptif(self, args, a_liberer):
-        self.donnees()
-        return self._res(self.etude.descriptif(), a_liberer)
 
-    def c_normalite(self, args, a_liberer):
-        if not args:
-            b, noms = self.boutons_colonnes("/normalite")
-            self.verifier_choix(noms, "numérique")
-            return [msg("Normalité : quelle série ?", b, remplace=True)]
-        return self._res(self.etude.normalite(self.colonne(args[0])), a_liberer)
+def generateurs(opt, k, res_max):
+    """Générateurs d'après gen=… ou fraction=n (liste proposée pour k facteurs)."""
+    if "gen" in opt:
+        g = [x.strip() for x in re.split(r"[,;]+", opt["gen"]) if x.strip()]
+        if not g:
+            raise doe.ErreurDOE("Option « gen » vide.")
+        return g
+    liste = doe.options_fractions(k, res_max=res_max)
+    if not liste:
+        raise doe.ErreurDOE(f"Aucune fraction proposée pour {k} facteurs : préciser les générateurs (gen=…).")
+    n = entier(opt.get("fraction", "1"), "fraction", 1)
+    if n > len(liste):
+        raise doe.ErreurDOE(f"Fraction {n} inexistante : {len(liste)} proposition(s) pour {k} facteurs.")
+    return liste[n - 1][1]
 
-    def c_t(self, args, a_liberer):
-        mots = {"welch", "apparie", "appariee", "egales", "sup", "inf"}
-        mu = None
-        libres = []
-        options = set()
-        for a in args:
-            if a.lower().startswith("mu="):
-                mu = st.lire_nombre(a[3:], "la valeur de référence")
-            elif a.lower() in mots:
-                options.add(a.lower())
+
+def parametres_plan(famille, facteurs, opt):
+    """(commande R, paramètres) d'après les options saisies."""
+    connues = {"criblage": {"methode", "essais", "fraction", "gen", "rep", "centres", "alea", "graine"},
+               "factoriel": {"type", "fraction", "gen", "rep", "centres", "alea", "graine"},
+               "taguchi": {"tableau", "interactions", "reponses", "alea", "graine"},
+               "surface": {"type", "alpha", "centres", "rep", "alea", "graine"},
+               "melange": {"type", "degre", "aretes", "faces", "axiaux", "centres", "rep", "alea", "graine"}}[famille]
+    inconnues = sorted(set(opt) - connues)
+    if inconnues:
+        raise doe.ErreurDOE(f"Option(s) non reconnue(s) : {', '.join(inconnues)}.")
+    base = {"aleatoire": booleen(opt["alea"], "alea") if "alea" in opt else True}
+    graine = doe.lire_nombre(opt.get("graine"), "graine")
+    base["graine"] = int(graine) if graine is not None else None
+    rep = entier(opt.get("rep", "1"), "rep", 1)
+    if famille in ("criblage", "factoriel"):
+        base.update({"facteurs": facteurs, "repetitions": rep, "points_centraux": entier(opt.get("centres", "0"), "centres")})
+        k = len(facteurs)
+        if famille == "criblage":
+            methode = opt.get("methode", "pb").lower()
+            if methode in ("pb", "plackett", "plackett-burman"):
+                ne = opt.get("essais", "auto")
+                base.update({"methode": "pb", "nb_essais": 0 if ne.lower() in ("auto", "automatique") else entier(ne, "essais", 4)})
+            elif methode in ("fraction", "fractionnaire"):
+                base.update({"methode": "fraction", "generateurs": generateurs(opt, k, 4)})
             else:
-                libres.append(a)
-        if not libres:
-            b, noms = self.boutons_colonnes("/t")
-            self.verifier_choix(noms, "numérique")
-            return [msg("Test t : choisir la série X.", b, remplace=True)]
-        x = self.colonne(libres[0])
-        ix = self.index(x)
-        if len(libres) == 1:
-            b, noms = self.boutons_colonnes(f"/t {ix}", exclure=(x,), supplements=[("Un seul échantillon (valeur de référence)", f"/t {ix} 0")])
-            return [msg(f"Série X : {x}. Comparer à quelle série ?", b, remplace=True)]
-        alt = "greater" if "sup" in options else "less" if "inf" in options else "two.sided"
-        if libres[1] == "0":                                   # test à un échantillon
-            if mu is None:
-                self.attente = {"type": "mu", "x": x, "alt": alt}
-                return [msg(f"Test t à un échantillon sur « {x} » : envoyez la valeur de référence (nombre). /annuler pour abandonner.")]
-            return self._res(self.etude.test_t(x, None, mu, alternative=alt), a_liberer)
-        y = self.colonne(libres[1])
-        iy = self.index(y)
-        mode = "apparie" if options & {"apparie", "appariee"} else "egales" if "egales" in options else "welch" if "welch" in options else None
-        if mode is None:
-            suf = ("" if alt == "two.sided" else (" sup" if alt == "greater" else " inf"))
-            b = [[("Indépendants (Welch)", f"/t {ix} {iy} welch{suf}")], [("Appariés", f"/t {ix} {iy} apparie{suf}")],
-                 [("Indépendants, variances égales", f"/t {ix} {iy} egales{suf}")]]
-            return [msg(f"Comparer « {x} » et « {y} » : type de test ?", b, remplace=True)]
-        return self._res(self.etude.test_t(x, y, 0.0, apparie=(mode == "apparie"), variances_egales=(mode == "egales"), alternative=alt), a_liberer)
-
-    def c_anova(self, args, a_liberer):
-        d = self.donnees()
-        num, txt = d.noms_num, d.noms_txt
-        if args and args[0].lower() == "colonnes":
-            return self._res(self.etude.anova("large", colonnes=num), a_liberer)
-        if len(args) >= 2:
-            return self._res(self.etude.anova("long", valeur=self.colonne(args[0]), groupe=self.colonne(args[1], "tout")), a_liberer)
-        if not num:
-            raise st.ErreurStat("Aucune colonne numérique.")
-        combos = [(v, g) for g in txt for v in num]
-        if not combos:
-            if len(num) < 2:
-                raise st.ErreurStat("ANOVA : il faut au moins deux colonnes numériques (une par groupe) ou une colonne de mesures et une colonne de groupes.")
-            return self._res(self.etude.anova("large", colonnes=num), a_liberer)
-        if len(combos) == 1 and len(num) == 1:
-            return self._res(self.etude.anova("long", valeur=combos[0][0], groupe=combos[0][1]), a_liberer)
-        b = [[(f"{v[:14]} par {g[:14]}", f"/anova {self.index(v)} {self.index(g)}")] for v, g in combos[:8]]
-        if len(num) >= 2:
-            b.append([("Chaque colonne numérique = un groupe", "/anova colonnes")])
-        return [msg("ANOVA : quelle organisation des données ?", b, remplace=True)]
-
-    def c_capa(self, args, a_liberer):
-        if not args:
-            b, noms = self.boutons_colonnes("/capa")
-            self.verifier_choix(noms, "numérique")
-            return [msg("Capabilité : quelle série ?", b, remplace=True)]
-        col = self.colonne(args[0])
-        if len(args) == 1:
-            self.attente = {"type": "capa", "col": col}
-            return [msg(f"Capabilité de « {col} » : envoyez les limites sous la forme\nLSL USL [cible] [σ intra-sous-groupe]\n"
-                        "séparées par des espaces ou des points-virgules ; « - » pour une valeur absente.\n"
-                        "Sans σ intra-sous-groupe, seuls Pp et Ppk sont calculés. /annuler pour abandonner.")]
-        return self._capa(col, args[1:], a_liberer)
-
-    def _capa(self, col, jetons, a_liberer):
-        v = [None if j in ("-", "_", "") else st.lire_nombre(j, "une limite") for j in jetons]
-        v += [None] * (4 - len(v))
-        if len(jetons) < 2 or len(jetons) > 4:
-            raise st.ErreurStat("Indiquer de 2 à 4 valeurs : LSL USL [cible] [σ intra-sous-groupe].")
-        lsl, usl, cible, sig = v[:4]
-        return self._res(self.etude.capabilite(col, lsl, usl, cible, sig), a_liberer)
-
-    def c_kappa(self, args, a_liberer):
-        d = self.donnees()
-        if len(d.noms) < 2:
-            raise st.ErreurStat("Le Kappa demande 2 colonnes d'évaluations.")
-        if not args:
-            b, _ = self.boutons_colonnes("/kappa", "tout")
-            return [msg("Kappa : évaluation de référence ?", b, remplace=True)]
-        a = self.colonne(args[0], "tout")
-        if len(args) == 1:
-            b, _ = self.boutons_colonnes(f"/kappa {self.index(a)}", "tout", exclure=(a,))
-            return [msg(f"Référence : {a}. Deuxième évaluation ?", b, remplace=True)]
-        return self._res(self.etude.kappa(a, self.colonne(args[1], "tout")), a_liberer)
-
-    def verifier_choix(self, noms, genre):
-        if not noms:
-            raise st.ErreurStat(f"Aucune colonne {genre} dans les données chargées (voir /etat).")
-
-    # -- réponse à une question posée par le bot ----------------------------------------------------
-    def reponse_attendue(self, texte, a_liberer):
-        att = self.attente
-        if att["type"] == "mu":
-            mu = st.lire_nombre(texte, "la valeur de référence")
-            if mu is None:
-                raise st.ErreurStat("Envoyez un nombre.")
-            self.attente = None
-            return self._res(self.etude.test_t(att["x"], None, mu, alternative=att["alt"]), a_liberer)
-        if att["type"] == "capa":
-            jetons = [j for j in re.split(r"[;\s]+", texte.strip()) if j != ""]
-            res = self._capa(att["col"], jetons, a_liberer)
-            self.attente = None
-            return res
-        self.attente = None
-        return [msg("Saisie annulée.")]
+                raise doe.ErreurDOE("methode : pb ou fraction.")
+            return "plan_criblage", base
+        t = opt.get("type", "fractionnaire" if ("gen" in opt or "fraction" in opt) else "complet").lower()
+        if t in ("complet", "c"):
+            base["type"] = "complet"
+        elif t in ("fractionnaire", "fraction", "f"):
+            base.update({"type": "fractionnaire", "generateurs": generateurs(opt, k, 99)})
+        else:
+            raise doe.ErreurDOE("type : complet ou fractionnaire.")
+        return "plan_factoriel", base
+    if famille == "taguchi":
+        n = len(facteurs)
+        inter = []
+        for t in re.split(r"[,;\s]+", opt.get("interactions", "")):
+            if not t:
+                continue
+            m = re.fullmatch(r"([A-Za-z])\*([A-Za-z])", t)
+            if not m:
+                raise doe.ErreurDOE(f"Interaction « {t} » : forme attendue A*B (lettres des facteurs).")
+            a, b = sorted((ord(m.group(1).upper()) - 65, ord(m.group(2).upper()) - 65))
+            if a == b or b >= n:
+                raise doe.ErreurDOE(f"Interaction « {t} » : facteurs invalides (lettres de A à {lettre(n - 1)}).")
+            if [a + 1, b + 1] not in inter:
+                inter.append([a + 1, b + 1])
+        tab = opt.get("tableau", "auto")
+        base.update({"facteurs": facteurs, "interactions": inter, "tableau": "auto" if tab.lower() in ("auto", "automatique") else tab.upper()})
+        entier(opt.get("reponses", "1"), "reponses", 1)
+        return "plan_taguchi", base
+    if famille == "surface":
+        t = opt.get("type", "ccc").lower()
+        if t not in dict(((c, 1) for _, c in doe.TYPES_SURFACE)):
+            raise doe.ErreurDOE("type : ccc, ccf, cci ou bb.")
+        base.update({"facteurs": facteurs, "type": t, "repetitions": rep})
+        if "centres" in opt:
+            base["points_centraux"] = entier(opt["centres"], "centres")
+        if t == "ccc" and "alpha" in opt:
+            a = opt["alpha"].lower()
+            if a in ("rotatable", "orthogonal"):
+                base["alpha_mode"] = a
+            else:
+                v = doe.lire_nombre(a, "alpha")
+                if v is None or v <= 0:
+                    raise doe.ErreurDOE("alpha : rotatable, orthogonal ou un nombre strictement positif.")
+                base.update({"alpha_mode": "personnalise", "alpha": v})
+        elif t == "ccc":
+            base["alpha_mode"] = "rotatable"
+        return "plan_surface", base
+    t = opt.get("type", "reseau").lower()
+    if t not in ("reseau", "centroide", "sommets"):
+        raise doe.ErreurDOE("type : reseau, centroide ou sommets.")
+    base.update({"composants": facteurs, "type": t, "repetitions": rep, "points_centraux": entier(opt.get("centres", "1"), "centres"),
+                 "axiaux": booleen(opt.get("axiaux", "non"), "axiaux"), "aretes": booleen(opt.get("aretes", "non"), "aretes"),
+                 "faces": booleen(opt.get("faces", "non"), "faces")})
+    if t == "reseau":
+        base["degre"] = entier(opt.get("degre", "2"), "degre", 1)
+    return "plan_melange", base
 
 
 class _Fichier:
@@ -494,8 +460,542 @@ class _Fichier:
         self.dossier = dossier
 
     def liberer(self):
-        import shutil
         shutil.rmtree(self.dossier, ignore_errors=True)
+
+
+# =============================================================================
+#  Session d'une conversation : plans + commandes
+# =============================================================================
+class Session:
+    def __init__(self):
+        self.plans = {}                           # famille -> doe.Plan
+        self.optimums = {}                        # famille -> dernier optimum calculé
+        self.courante = None
+        self.attente = None                       # saisie en attente : {"type": "plan"|"reponses", ...}
+        self.alpha = 0.05
+        self.modeles = {}                         # famille -> dernières options de modèle (reprises par défaut)
+
+    # -- plan actif ---------------------------------------------------------------
+    def plan(self):
+        if self.courante is None or self.courante not in self.plans:
+            raise doe.ErreurDOE("Aucun plan en cours. Choisissez une famille de plans : /criblage, /factoriel, /taguchi, /surface ou /mélange.")
+        return self.plans[self.courante]
+
+    def en_tete(self):
+        p = self.plan()
+        return f"{NOMS_FAMILLES[self.courante]} — {p.n} essais"
+
+    # -- aiguillage -------------------------------------------------------------------
+    def handle(self, texte):
+        """Retourne (items, résultats à libérer après envoi)."""
+        a_liberer = []
+        try:
+            return self._handle(texte, a_liberer), a_liberer
+        except doe.ErreurDOE as e:
+            return [msg("⚠️ " + str(e))], a_liberer
+
+    def _res(self, res, a_liberer, famille=None):
+        a_liberer.append(res)
+        if res.optimum and famille:
+            self.optimums[famille] = res.optimum
+        return items_resultat(res)
+
+    def _handle(self, texte, a_liberer):
+        texte = texte.strip()
+        if not texte.startswith("/"):
+            return self.texte_libre(texte, a_liberer)
+        premiere, _, suite = texte.partition("\n")
+        parts = premiere.split()
+        cmd = parts[0].lower().split("@")[0]
+        cmd = cmd.replace("é", "e").replace("è", "e")
+        args = parts[1:]
+        if cmd != "/annuler":
+            self.attente = None
+        table = {"/start": self.c_start, "/aide": self.c_aide, "/help": self.c_aide, "/etat": self.c_etat, "/effacer": self.c_effacer,
+                 "/annuler": self.c_annuler, "/export": self.c_export, "/famille": self.c_famille, "/plan": self.c_plan,
+                 "/reponses": self.c_reponses, "/analyse": self.c_analyse, "/graphiques": self.c_graphiques, "/prevoir": self.c_prevoir,
+                 "/optimiser": self.c_optimiser, "/alpha": self.c_alpha}
+        if cmd[1:] in FAMILLES:
+            return self.c_definir(cmd[1:], args, suite, a_liberer)
+        f = table.get(cmd)
+        if f is None:
+            return [msg("Commande inconnue. /aide pour la liste.")]
+        return f(args, suite, a_liberer)
+
+    def texte_libre(self, texte, a_liberer):
+        att = self.attente
+        if att:
+            self.attente = None
+            if att["type"] == "plan":
+                return self.definir(att["famille"], texte, a_liberer)
+            if att["type"] == "reponses":
+                return self.integrer(texte, att["standard"])
+            if att["type"] == "points":
+                return self.c_prevoir([], texte, a_liberer)
+        if self.courante in self.plans:                       # colonnes de nombres sans commande : réponses
+            try:
+                _, vals = doe.lire_tableau_texte(texte)
+            except doe.ErreurDOE:
+                vals = None
+            if vals is not None and len(vals) == self.plans[self.courante].n:
+                return self.integrer(texte, False)
+        return [msg("Je n'ai pas compris ce message. Utilisez les boutons ou /aide.", BTN_MENU)]
+
+    # -- aide -----------------------------------------------------------------------------
+    def c_start(self, args, suite, a_liberer):
+        return [msg("🧪 DOE — plans d'expériences\n\nChoisissez une famille de plans, définissez les facteurs, saisissez les réponses "
+                    "mesurées, puis analysez, prévoyez et optimisez. /aide pour le détail.", BTN_MENU)]
+
+    def c_aide(self, args, suite, a_liberer):
+        return [msg(
+            "🧪 DOE — aide\n\n"
+            "Démarche\n"
+            "1. Créer un plan : /criblage /factoriel /taguchi /surface /melange (la commande affiche la syntaxe des facteurs).\n"
+            "2. /reponses puis envoyer les mesures (une colonne par réponse, une ligne par essai, dans l'ordre d'exécution du plan ; "
+            "« /reponses standard » pour l'ordre standard). Nom de colonne en première ligne facultatif.\n"
+            "3. /analyse [rep=Y1] [modele=…] [reduire] [seuil=0,05]\n"
+            "   Taguchi : /analyse [rep=Y1,Y2] [rsb=plus_grand|plus_petit|nominal_1|nominal_2] [regroupement=non] [confirmation=3]\n"
+            "4. /graphiques [rep=Y1] [X Y] [contour|surface|les_deux] [A=valeur …]   (factoriel, surface, mélange)\n"
+            "   Mélange : /graphiques [rep=Y1] [A B C]  (composants du triangle)\n"
+            "5. /prevoir   puis un point par ligne : valeurs dans l'ordre des facteurs, ou A=… B=… (lettres des facteurs), "
+            "ou « centre », ou « optimum »\n"
+            "6. /optimiser [Y1=max] [Y2=min] [Y3=cible:12]   (limites : max:inf:cible, min:cible:sup, cible:valeur:inf:sup)\n\n"
+            "Modèles (modele=) : criblage ordre1 ordre2 · factoriel ordre1 à ordre4 · surface lineaire interactions quadratique · "
+            "melange lineaire quadratique cubique_special cubique.\n\n"
+            "Autres\n/famille · /plan · /etat · /alpha [valeur] · /export · /effacer · /annuler\n\n"
+            "Les plans ne sont conservés qu'en mémoire du bot, le temps de la conversation.", BTN_MENU)]
+
+    def c_annuler(self, args, suite, a_liberer):
+        self.attente = None
+        return [msg("Saisie annulée.", BTN_MENU)]
+
+    def c_alpha(self, args, suite, a_liberer):
+        if not args:
+            return [msg(f"Risque α actuel : {doe.fmt_nombre(self.alpha, 4)}. Modifier : /alpha 0,01")]
+        self.alpha = doe.lire_alpha(args[0])
+        return [msg(f"Risque α : {doe.fmt_nombre(self.alpha, 4)}.")]
+
+    # -- création d'un plan --------------------------------------------------------------------
+    def c_definir(self, famille, args, suite, a_liberer):
+        texte = (" ".join(args) + "\n" + suite).strip()
+        if texte:
+            return self.definir(famille, texte, a_liberer)
+        self.attente = {"type": "plan", "famille": famille}
+        return [msg(AIDE_PLAN[famille] + "\n\n/annuler pour abandonner.")]
+
+    def definir(self, famille, texte, a_liberer):
+        lignes, opt = decouper_definition(texte)
+        cfg = FAMILLES[famille]
+        facteurs = lire_facteurs(famille, lignes)
+        if not cfg["nmin"] <= len(facteurs) <= cfg["nmax"]:
+            raise doe.ErreurDOE(f"Ce plan accepte de {cfg['nmin']} à {cfg['nmax']} {cfg['mot_f'].lower()} ({len(facteurs)} saisi(s)).")
+        commande, params = parametres_plan(famille, facteurs, opt)
+        plan = doe.generer_plan(famille, commande, params, facteurs)
+        nrep = entier(opt.get("reponses", "1"), "reponses", 1) if famille == "taguchi" else 1
+        for i in range(nrep):
+            plan.ajouter_reponse(f"Y{i + 1}")
+        self.plans[famille] = plan
+        self.optimums.pop(famille, None)
+        self.modeles.pop(famille, None)
+        self.courante = famille
+        return self.items_plan(plan, f"✅ Plan généré : {plan.n} essais.", avec_description=True)
+
+    # -- affichage du plan -------------------------------------------------------------------
+    def items_plan(self, plan, titre, avec_description=False):
+        facteurs = plan.noms_facteurs
+        codes = [lettre(i) for i in range(len(facteurs))]
+        cols = [c for c in ("Ordre_essai",) if c in plan.cols] + facteurs + plan.reponses
+        entetes = ["N°"] + [codes[facteurs.index(c)] if c in facteurs else c[:7] for c in cols[1:]] if cols and cols[0] == "Ordre_essai" else \
+            [codes[facteurs.index(c)] if c in facteurs else c[:7] for c in cols]
+        lignes = []
+        for i in range(plan.n):
+            ligne = []
+            for c in cols:
+                v = plan.cols[c][i]
+                ligne.append("" if v is None else doe.fmt_nombre(v, 5)[:9])
+            lignes.append(ligne)
+        larg = [max(len(entetes[j]), *(len(l[j]) for l in lignes)) for j in range(len(cols))]
+        fmt = lambda l: "  ".join(v.rjust(larg[j]) for j, v in enumerate(l))
+        table = "\n".join([fmt(entetes), "  ".join("-" * w for w in larg)] + [fmt(l) for l in lignes])
+        legende = "\n".join(f"{codes[i]} = {n}" + (f" ({doe.fmt_nombre(f['bas'], 6)} à {doe.fmt_nombre(f['haut'], 6)})" if "bas" in f and "haut" in f
+                            else f" ({' ; '.join(str(x) for x in f['niveaux'])})" if "niveaux" in f else "")
+                            for i, (n, f) in enumerate(zip(facteurs, plan.facteurs)))
+        blocs = [f"<b>{esc(titre)}</b>", f"<b>{esc(plan.titre)}</b>", esc(legende)]
+        blocs.extend(blocs_pre(table))
+        lignes_desc = [l for l in plan.lignes if l.strip() != plan.titre.strip()]
+        if avec_description and lignes_desc:
+            blocs.append(esc("\n".join(lignes_desc)))
+        if avec_description:
+            for nom, t in plan.tables.items():
+                cl = list(t.keys())
+                rows = [list(r) for r in zip(*[doe._cellules(t[c]) for c in cl])]
+                blocs.append(f"<b>{esc(doe.libelle(nom))}</b>")
+                blocs.extend(blocs_pre(doe.table_texte(cl, rows, libre=True)))
+        manque = [r for r in plan.reponses if plan.nb_renseignes(r) < plan.n]
+        suite = ("Prochaine étape : /reponses pour saisir les mesures (colonne(s) : " + ", ".join(plan.reponses) + ").") if manque else "Réponses saisies : /analyse."
+        items = [msg(t, html_=True) for t in regrouper(blocs)]
+        items.append(msg(suite, [[("✍️ Saisir les réponses", "/reponses"), ("📤 Export CSV", "/export")], [("📊 Analyse", "/analyse")]]))
+        return items
+
+    def c_plan(self, args, suite, a_liberer):
+        return self.items_plan(self.plan(), self.en_tete(), avec_description=bool(args and args[0].lower() == "detail"))
+
+    def c_famille(self, args, suite, a_liberer):
+        if args:
+            cle = args[0].lower().replace("é", "e")
+            if cle not in FAMILLES:
+                raise doe.ErreurDOE("Famille inconnue : criblage, factoriel, taguchi, surface ou melange.")
+            if cle not in self.plans:
+                raise doe.ErreurDOE(f"Aucun plan « {NOMS_FAMILLES[cle]} » en cours : /{cle} pour en créer un.")
+            self.courante = cle
+            return self.items_plan(self.plans[cle], self.en_tete())
+        if not self.plans:
+            raise doe.ErreurDOE("Aucun plan en cours.")
+        b = [[(("▶ " if c == self.courante else "") + f"{NOMS_FAMILLES[c]} ({p.n} essais)", f"/famille {c}")] for c, p in self.plans.items()]
+        return [msg("Plan actif : choisir la famille.", b, remplace=True)]
+
+    def c_etat(self, args, suite, a_liberer):
+        if not self.plans:
+            return [msg("Aucun plan en cours.", BTN_MENU)]
+        lignes = []
+        for c, p in self.plans.items():
+            rep = ", ".join(f"{r} ({p.nb_renseignes(r)}/{p.n})" for r in p.reponses) or "aucune réponse"
+            lignes.append(f"{'▶ ' if c == self.courante else '• '}{NOMS_FAMILLES[c]} : {p.n} essais ; facteurs : {', '.join(p.noms_facteurs)} ; réponses : {rep}")
+        lignes.append(f"\nRisque α : {doe.fmt_nombre(self.alpha, 4)}")
+        return [msg("\n".join(lignes), BTN_MENU)]
+
+    def c_effacer(self, args, suite, a_liberer):
+        p = self.plan()
+        cle = self.courante
+        del self.plans[cle]
+        self.optimums.pop(cle, None)
+        self.courante = next(iter(self.plans), None)
+        return [msg(f"🗑 Plan « {NOMS_FAMILLES[cle]} » effacé.", BTN_MENU)]
+
+    def c_export(self, args, suite, a_liberer):
+        p = self.plan()
+        dossier = Path(tempfile.mkdtemp(prefix="doe_export_"))
+        chemin = dossier / f"plan_{self.courante}_{datetime.now():%Y%m%d_%H%M}.csv"
+        p.exporter_csv(chemin)
+        a_liberer.append(_Fichier(dossier))
+        return [{"document": chemin}]
+
+    # -- réponses ---------------------------------------------------------------------------------
+    def c_reponses(self, args, suite, a_liberer):
+        p = self.plan()
+        standard = any(a.lower() in ("standard", "std") for a in args)
+        texte = suite.strip()
+        if texte:
+            return self.integrer(texte, standard)
+        self.attente = {"type": "reponses", "standard": standard}
+        ordre = "l'ordre standard" if standard else "l'ordre d'exécution"
+        return [msg(f"✍️ Réponses — plan « {NOMS_FAMILLES[self.courante]} » ({p.n} essais)\n\n"
+                    f"Envoyez les mesures dans {ordre} du plan : une ligne par essai, une colonne par réponse "
+                    f"(séparateurs : espace, tabulation ou point-virgule ; décimale point ou virgule).\n"
+                    "Une première ligne de noms est facultative : sans noms, les colonnes vont aux réponses du plan "
+                    f"({', '.join(p.reponses) or 'aucune'}) ; avec un nom nouveau, une réponse est créée.\n"
+                    "Un fichier csv ou txt joint est aussi accepté.\n\n/annuler pour abandonner.")]
+
+    def integrer(self, texte, standard):
+        p = self.plan()
+        n = doe.integrer_reponses(p, texte, standard)
+        self.optimums.pop(self.courante, None)
+        manque = [r for r in p.reponses if p.nb_renseignes(r) < p.n]
+        txt = f"✅ {n} colonne(s) de réponses enregistrée(s) ({', '.join(p.reponses)})."
+        if manque:
+            txt += "\n⚠️ Valeurs manquantes : " + ", ".join(f"{r} ({p.nb_renseignes(r)}/{p.n})" for r in manque) + "."
+        return [msg(txt, [[("📊 Analyse", "/analyse"), ("📋 Plan", "/plan")]])]
+
+    def integrer_fichier(self, texte, standard=False):
+        return self.integrer(texte, standard)
+
+    # -- options communes -----------------------------------------------------------------------
+    def _options(self, args):
+        """args -> (clé=valeur, mots libres)."""
+        opt, libres = {}, []
+        for a in args:
+            if "=" in a and not a.startswith("="):
+                k, v = a.split("=", 1)
+                opt[k.strip().lower()] = v.strip()
+            else:
+                libres.append(a)
+        return opt, libres
+
+    def _reponse(self, opt, libres, prefixe, a_liberer=None, invite="Quelle réponse ?", suppl=()):
+        """Nom de la réponse choisie ; sinon retourne un message de choix (tuple (None, items))."""
+        p = self.plan()
+        dispo = [r for r in p.reponses if p.nb_renseignes(r) >= 2]
+        if not dispo:
+            raise doe.ErreurDOE("Aucune réponse renseignée : /reponses pour saisir les mesures.")
+        r = opt.get("rep") or opt.get("reponse")
+        if r is None and libres and libres[0] in dispo and prefixe:
+            r = libres[0]
+        if r is None:
+            if len(dispo) == 1:
+                return dispo[0], None
+            b = [[(n, f"{prefixe} rep={n}")] for n in dispo] + [[(l, c)] for l, c in suppl]
+            return None, [msg(invite, b, remplace=True)]
+        trouve = [n for n in p.reponses if n.lower() == r.lower()]
+        if not trouve:
+            raise doe.ErreurDOE(f"Réponse introuvable : « {r} » (réponses : {', '.join(p.reponses)}).")
+        return trouve[0], None
+
+    def _modele(self, opt):
+        cle = self.courante
+        if cle == "taguchi":
+            return None
+        code = opt.get("modele", self.modeles.get(cle, {}).get("modele", doe.MODELE_DEFAUT[cle])).lower()
+        if code not in MODELES_COURTS[cle]:
+            raise doe.ErreurDOE(f"Modèle « {code} » inconnu pour ce plan. Modèles : {', '.join(MODELES_COURTS[cle])}.")
+        return code
+
+    def _params_modele(self, opt, libres):
+        """Options du modèle ; celles de la dernière analyse sont reprises si rien n'est précisé."""
+        prec = self.modeles.get(self.courante, {})
+        if "reduire" in [l.lower() for l in libres]:
+            reduire = True
+        elif "reduire" in opt:
+            reduire = opt["reduire"].lower() in ("oui", "1", "vrai")
+        else:
+            reduire = prec.get("reduire", False)
+        seuil = doe.lire_alpha(opt["seuil"]) if "seuil" in opt else prec.get("alpha_sortie", 0.05)
+        p = {"modele": self._modele(opt), "reduire": reduire, "alpha_sortie": seuil}
+        if self.courante == "melange":
+            p["pseudo"] = booleen(opt["pseudo"], "pseudo") if "pseudo" in opt else prec.get("pseudo", True)
+        self.modeles[self.courante] = dict(p)
+        return p
+
+    def _params_taguchi(self, opt):
+        p = self.plan()
+        if "rep" in opt or "reponse" in opt or "reponses" in opt:
+            noms = [x for x in re.split(r"[,;]+", opt.get("rep") or opt.get("reponse") or opt["reponses"]) if x.strip()]
+            reps = []
+            for n in noms:
+                t = [r for r in p.reponses if r.lower() == n.strip().lower()]
+                if not t:
+                    raise doe.ErreurDOE(f"Réponse introuvable : « {n} » (réponses : {', '.join(p.reponses)}).")
+                reps.append(t[0])
+        else:
+            reps = [r for r in p.reponses if p.nb_renseignes(r) == p.n]
+        if not reps:
+            raise doe.ErreurDOE("Aucune réponse complète : /reponses pour saisir les mesures.")
+        for r in reps:
+            if p.nb_renseignes(r) < p.n:
+                raise doe.ErreurDOE(f"La réponse « {r} » n'est pas renseignée pour tous les essais.")
+        rsb = opt.get("rsb", "plus_grand").lower()
+        if rsb not in [c for _, c in doe.TYPES_RSB]:
+            raise doe.ErreurDOE("rsb : plus_grand, plus_petit, nominal_1 ou nominal_2.")
+        nc = doe.lire_nombre(opt.get("confirmation", "3"), "confirmation")
+        if nc is None or nc < 1:
+            raise doe.ErreurDOE("confirmation : au moins 1 essai.")
+        return {"reponses": reps, "type_rsb": rsb, "regroupement": "aucun" if opt.get("regroupement", "auto").lower() in ("non", "aucun") else "auto",
+                "n_confirmation": nc}
+
+    # -- analyse ---------------------------------------------------------------------------------
+    def c_analyse(self, args, suite, a_liberer):
+        p = self.plan()
+        opt, libres = self._options(args)
+        if self.courante == "taguchi":
+            params = self._params_taguchi(opt)
+        else:
+            r, items = self._reponse(opt, libres, "/analyse", invite="Analyse : quelle réponse ?")
+            if items:
+                return items
+            if p.nb_renseignes(r) < 2:
+                raise doe.ErreurDOE(f"La réponse « {r} » doit être renseignée pour au moins deux essais.")
+            params = {"reponse": r, **self._params_modele(opt, libres)}
+        return self._calcul("analyse", params, a_liberer)
+
+    def _calcul(self, commande, params, a_liberer):
+        res = doe.executer_r(self.plan(), commande, params, 1.2, self.alpha)
+        return self._res(res, a_liberer, self.courante)
+
+    # -- graphiques du modèle ----------------------------------------------------------------------
+    def c_graphiques(self, args, suite, a_liberer):
+        p = self.plan()
+        cle = self.courante
+        if cle not in ("factoriel", "surface", "melange"):
+            raise doe.ErreurDOE("Les graphiques du modèle concernent les plans factoriel, de surface et de mélange (l'analyse fournit déjà les graphiques des autres plans).")
+        opt, libres = self._options(args)
+        r, items = self._reponse(opt, libres, "/graphiques", invite="Graphiques : quelle réponse ?")
+        if items:
+            return items
+        params = {"reponse": r, **self._params_modele(opt, libres)}
+        noms = p.noms_facteurs
+        codes = {lettre(i).lower(): n for i, n in enumerate(noms)}
+        codes.update({n.lower(): n for n in noms})
+        mots = [l for l in libres if l.lower() not in ("reduire",) and l.lower() != r.lower()]
+        if cle == "melange":
+            if len(noms) < 3:
+                raise doe.ErreurDOE("Le diagramme ternaire exige au moins trois composants.")
+            choix = [codes[m.lower()] for m in mots if m.lower() in codes][:3] or noms[:3]
+            if len(set(choix)) < 3:
+                raise doe.ErreurDOE("Indiquer trois composants différents pour le triangle (ex. : A B C).")
+            params["composants_axes"] = [noms.index(c) + 1 for c in choix]
+            params["fixes"] = {codes[k.lower()]: doe.lire_nombre(v) for k, v in opt.items() if k.lower() in codes and v}
+            params["type"] = "contour"
+        else:
+            quant = [f["nom"] for f in p.facteurs if f.get("type", "num") == "num"]
+            axes = [codes[m.lower()] for m in mots if m.lower() in codes and codes[m.lower()] in quant]
+            if len(axes) < 2:
+                axes = quant[:2]
+            if len(axes) < 2 or axes[0] == axes[1]:
+                raise doe.ErreurDOE("Il faut deux facteurs quantitatifs différents pour les axes (ex. : A B).")
+            type_ = next((m.lower() for m in mots if m.lower() in ("contour", "surface", "les_deux")), "contour")
+            fixes = {}
+            for k, v in opt.items():
+                if k.lower() in codes and v:
+                    n = codes[k.lower()]
+                    f = next(f for f in p.facteurs if f["nom"] == n)
+                    fixes[n] = v if f.get("type") == "cat" else doe.lire_nombre(v, f"la valeur de « {n} »")
+            params.update({"axe_x": axes[0], "axe_y": axes[1], "type": type_, "fixes": fixes})
+        return self._calcul("surfaces", params, a_liberer)
+
+    # -- prévision -----------------------------------------------------------------------------------
+    def _valeur_centrale(self, f):
+        if "niveaux" in f:
+            return str(f["niveaux"][0]) if self.courante == "taguchi" or f.get("type") == "cat" else None
+        if self.courante == "melange":
+            col = [v for v in self.plans[self.courante].cols[f["nom"]] if v is not None]
+            return sum(col) / len(col) if col else None
+        return (f["bas"] + f["haut"]) / 2
+
+    def _point(self, ligne):
+        p = self.plan()
+        cle = self.courante
+        noms = p.noms_facteurs
+        codes = {lettre(i).lower(): n for i, n in enumerate(noms)}
+        codes.update({n.lower(): n for n in noms})
+        t = ligne.strip()
+        pt = {}
+        if t.lower() in ("centre", "central", "centrale", "milieu"):
+            pass
+        elif t.lower() == "optimum":
+            o = self.optimums.get(cle)
+            if not o:
+                raise doe.ErreurDOE("Aucun optimum disponible : lancer d'abord " + ("/analyse." if cle == "taguchi" else "/optimiser."))
+            for n, v in o.items():
+                if n in noms:
+                    pt[n] = v
+        elif "=" in t:
+            for jeton in t.replace(";", " ").split():
+                if "=" not in jeton:
+                    raise doe.ErreurDOE(f"« {jeton} » : forme attendue A=valeur.")
+                k, v = jeton.split("=", 1)
+                if k.lower() not in codes:
+                    raise doe.ErreurDOE(f"Facteur inconnu : « {k} » (lettres : {', '.join(lettre(i) for i in range(len(noms)))}).")
+                pt[codes[k.lower()]] = v
+        else:
+            vals = [x for x in re.split(r"[;\s]+", t) if x]
+            if len(vals) != len(noms):
+                raise doe.ErreurDOE(f"{len(noms)} valeur(s) attendue(s) (dans l'ordre : {', '.join(noms)}), {len(vals)} reçue(s).")
+            pt = dict(zip(noms, vals))
+        sortie = {}
+        for f in p.facteurs:
+            n = f["nom"]
+            v = pt.get(n)
+            if v is None:
+                v = self._valeur_centrale(f)
+            if v is None:
+                raise doe.ErreurDOE(f"Valeur manquante pour « {n} ».")
+            if cle == "taguchi" or f.get("type") == "cat":
+                niv = [str(x) for x in f["niveaux"]]
+                if str(v) not in niv:
+                    raise doe.ErreurDOE(f"« {n} » : niveau « {v} » inconnu (niveaux : {' ; '.join(niv)}).")
+                sortie[n] = str(v)
+            else:
+                sortie[n] = v if isinstance(v, (int, float)) else doe.lire_nombre(v, f"la valeur de « {n} »")
+        return sortie
+
+    CLES_MODELE = ("rep", "reponse", "reponses", "modele", "seuil", "pseudo", "rsb", "regroupement", "confirmation")
+
+    def c_prevoir(self, args, suite, a_liberer):
+        p = self.plan()
+        opt, _ = self._options([a for a in args if "=" in a and a.split("=")[0].lower() in self.CLES_MODELE])
+        lignes = [l for l in suite.replace("\r", "").split("\n") if l.strip()]
+        inline = " ".join(a for a in args if not ("=" in a and a.split("=")[0].lower() in self.CLES_MODELE))
+        if inline.strip():
+            lignes.insert(0, inline.strip())
+        if not lignes:
+            self.attente = {"type": "points"}
+            noms = p.noms_facteurs
+            return [msg("🎯 Prévision — un point par ligne :\n"
+                        f"• valeurs dans l'ordre des facteurs ({', '.join(noms)}), séparées par des espaces ;\n"
+                        "• ou A=valeur B=valeur… (lettres des facteurs ; un facteur omis prend sa valeur centrale) ;\n"
+                        "• ou « centre » ; ou « optimum » (dernier optimum calculé).\n\n/annuler pour abandonner.",
+                        [[("Centre du domaine", "/prevoir centre"), ("Optimum", "/prevoir optimum")]])]
+        points = [self._point(l) for l in lignes[:30]]
+        if self.courante == "taguchi":
+            params = self._params_taguchi(opt)
+        else:
+            r, items = self._reponse(opt, [], "")
+            if items:                                           # plusieurs réponses : demander laquelle, en reprenant les points
+                ptxt = " ".join(lignes[:1]) if len(lignes) == 1 else ""
+                b = [[(n, f"/prevoir rep={n} {ptxt}".strip())] for n in p.reponses if p.nb_renseignes(n) >= 2]
+                if len(lignes) > 1:
+                    return [msg("Plusieurs points : préciser la réponse avec rep=Y1 (ex. : /prevoir rep=Y1 puis un point par ligne).")]
+                return [msg("Prévision : quelle réponse ?", b, remplace=True)]
+            params = {"reponse": r, **self._params_modele(opt, [])}
+        params["points"] = points
+        return self._calcul("prevision", params, a_liberer)
+
+    # -- optimisation -----------------------------------------------------------------------------------
+    def c_optimiser(self, args, suite, a_liberer):
+        p = self.plan()
+        if self.courante == "taguchi":
+            raise doe.ErreurDOE("Pour un plan de Taguchi, les niveaux optimaux sont fournis par /analyse (puis /prevoir optimum).")
+        opt, libres = self._options(args)
+        dispo = [r for r in p.reponses if p.nb_renseignes(r) >= 2]
+        if not dispo:
+            raise doe.ErreurDOE("Aucune réponse renseignée : /reponses pour saisir les mesures.")
+        objectifs = {}
+        for cle, v in opt.items():
+            if cle in ("modele", "seuil", "pseudo", "reduire"):
+                continue
+            nom = next((r for r in dispo if r.lower() == cle), None)
+            if nom is None:
+                raise doe.ErreurDOE(f"Réponse inconnue ou non renseignée : « {cle} » (réponses : {', '.join(dispo)}).")
+            objectifs[nom] = v
+        if not objectifs:
+            if len(dispo) == 1:
+                b = [[("Maximiser", f"/optimiser {dispo[0]}=max"), ("Minimiser", f"/optimiser {dispo[0]}=min")]]
+                return [msg(f"Optimisation de « {dispo[0]} » : quel objectif ?\n(Plusieurs réponses : /optimiser Y1=max Y2=min Y3=cible:12)", b, remplace=True)]
+            return [msg("🏁 Optimisation — indiquer l'objectif de chaque réponse :\n"
+                        f"/optimiser {' '.join(r + '=max' for r in dispo[:2])}\n\n"
+                        "Objectifs : max, min, cible:valeur\n"
+                        "Limites facultatives : max:inf:cible · min:cible:sup · cible:valeur:inf:sup\n"
+                        "Importance facultative : ajouter /2 (ex. : Y1=max/2)")]
+        reps = []
+        for nom, v in objectifs.items():
+            imp = 1.0
+            if "/" in v:
+                v, i = v.rsplit("/", 1)
+                imp = doe.lire_nombre(i, f"l'importance de « {nom} »")
+                if imp is None or imp <= 0:
+                    raise doe.ErreurDOE(f"L'importance de « {nom} » doit être strictement positive.")
+            champs = v.split(":")
+            but = BUTS.get(champs[0].lower())
+            if but is None:
+                raise doe.ErreurDOE(f"Objectif « {champs[0]} » inconnu pour « {nom} » : max, min ou cible.")
+            nums = [doe.lire_nombre(c, f"« {nom} »") for c in champs[1:]]
+            d = {"nom": nom, "but": but, "importance": imp}
+            if but == "max":
+                for k, x in zip(("inf", "cible"), nums):
+                    if x is not None:
+                        d[k] = x
+            elif but == "min":
+                for k, x in zip(("cible", "sup"), nums):
+                    if x is not None:
+                        d[k] = x
+            else:
+                if not nums:
+                    raise doe.ErreurDOE(f"« {nom} » : indiquer la valeur cible (cible:valeur).")
+                for k, x in zip(("cible", "inf", "sup"), nums):
+                    if x is not None:
+                        d[k] = x
+            reps.append(d)
+        params = {**self._params_modele(opt, libres), "reponses": reps}
+        return self._calcul("optimisation", params, a_liberer)
 
 
 # =============================================================================
@@ -516,11 +1016,6 @@ class Bot:
         self.sessions = {}
         self.verrous = {}
         self.global_lock = threading.Lock()
-        atexit.register(self._nettoyer)
-
-    def _nettoyer(self):
-        for sess in list(self.sessions.values()):
-            sess.liberer_fichier()
 
     # -- utilitaires
     def masquer(self, texte):
@@ -616,7 +1111,7 @@ class Bot:
             for r in a_liberer:
                 r.liberer()
 
-    # -- message texte ou fichier
+    # -- message texte ou fichier (réponses au format csv / txt)
     def traiter(self, chat_id, m):
         def travail(session):
             if m.get("text"):
@@ -624,27 +1119,26 @@ class Bot:
                 self._livrer(chat_id, items, lib)
             elif m.get("document"):
                 doc = m["document"]
-                nom = Path(doc.get("file_name") or "donnees").name
-                if Path(nom).suffix.lower() not in EXTENSIONS:
-                    self.envoyer_texte(chat_id, msg("⚠️ Format non pris en charge. Formats acceptés : csv, txt, tsv, dat, xlsx."))
-                elif (doc.get("file_size") or 0) > 20 * 1024 * 1024:
-                    self.envoyer_texte(chat_id, msg("⚠️ Fichier trop volumineux : 20 Mo au maximum."))
+                nom = Path(doc.get("file_name") or "reponses").name
+                if Path(nom).suffix.lower() not in (".csv", ".txt", ".tsv", ".dat"):
+                    self.envoyer_texte(chat_id, msg("⚠️ Format non pris en charge. Formats acceptés pour les réponses : csv, txt, tsv, dat."))
+                elif (doc.get("file_size") or 0) > MAX_FICHIER:
+                    self.envoyer_texte(chat_id, msg("⚠️ Fichier trop volumineux : 5 Mo au maximum."))
                 else:
-                    donnees = self.telecharger(doc["file_id"])
-                    dossier = Path(tempfile.mkdtemp(prefix="stat_fichier_"))
-                    chemin = dossier / nom
-                    chemin.write_bytes(donnees)
+                    contenu = self.telecharger(doc["file_id"])
                     try:
-                        try:
-                            items = session.charger_fichier(chemin, nom)
-                        except st.ErreurStat as e:
-                            items = [msg(f"⚠️ {e}")]
-                        self._livrer(chat_id, items)
-                    finally:
-                        if not (session.brut and session.brut[0] == "fichier" and session.brut[1] == chemin):
-                            _Fichier(dossier).liberer()
+                        texte = contenu.decode("utf-8-sig")
+                    except UnicodeDecodeError:
+                        texte = contenu.decode("latin-1")
+                    try:
+                        standard = bool(session.attente and session.attente.get("type") == "reponses" and session.attente.get("standard"))
+                        session.attente = None
+                        items = session.integrer(texte, standard)
+                    except doe.ErreurDOE as e:
+                        items = [msg(f"⚠️ {e}")]
+                    self._livrer(chat_id, items)
             elif m.get("photo"):
-                self.envoyer_texte(chat_id, msg("Les images ne sont pas analysées ici. Envoyez les données en texte ou en fichier (csv, txt, tsv, dat, xlsx)."))
+                self.envoyer_texte(chat_id, msg("Les images ne sont pas analysées ici. Envoyez les mesures en texte ou en fichier (csv, txt)."))
         self._executer(chat_id, travail)
 
     # -- clic sur un bouton : la commande du bouton est exécutée comme si elle était tapée
@@ -666,11 +1160,11 @@ class Bot:
     # -- message de démarrage
     def message_demarrage(self):
         ntp_ok = attendre_ntp(timeout=60)
-        ok_r, info_r = st.verifier_r()
-        texte = (f"📊 Bot DoE démarré\n"
+        ok_r, info_r = doe.verifier_r()
+        texte = (f"🧪 Bot DOE démarré\n"
                  f"📅 {datetime.now():%d/%m/%Y %H:%M:%S}{'' if ntp_ok else chr(10) + '⚠️ Heure non synchronisée NTP'}\n"
                  f"{'✅' if ok_r else '⚠️'} {info_r}\n\n"
-                 "Envoyez des données (texte ou fichier) pour commencer.")
+                 "Choisissez une famille de plans pour commencer.")
         self.envoyer_texte(self.proprio, msg(texte, BTN_MENU))
 
     # -- boucle principale
@@ -681,7 +1175,7 @@ class Bot:
             print(f"[menu] {self.masquer(e)}")
         if not self.autorises:
             print("⚠️ Aucun identifiant autorisé : le bot est ouvert à tous.")
-        print(f"Bot DoE démarré — {len(self.autorises)} identifiant(s) autorisé(s). Ctrl+C pour arrêter.")
+        print(f"Bot DOE démarré — {len(self.autorises)} identifiant(s) autorisé(s). Ctrl+C pour arrêter.")
         if self.proprio:                                       # confirmation de démarrage dans Telegram
             try:
                 self.message_demarrage()
