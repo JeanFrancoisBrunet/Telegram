@@ -478,7 +478,7 @@ class Session:
     # -- plan actif ---------------------------------------------------------------
     def plan(self):
         if self.courante is None or self.courante not in self.plans:
-            raise doe.ErreurDOE("Aucun plan en cours. Choisissez une famille de plans : /criblage, /factoriel, /taguchi, /surface ou /mélange.")
+            raise doe.ErreurDOE("Aucun plan en cours. Choisissez une famille de plans : /criblage, /factoriel, /taguchi, /surface ou /melange.")
         return self.plans[self.courante]
 
     def en_tete(self):
