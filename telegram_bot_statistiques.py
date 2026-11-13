@@ -54,6 +54,7 @@ COMMANDES_MENU = [
     ("t", "Test t (1 ou 2 échantillons, apparié)"),
     ("anova", "ANOVA à un facteur (+ Tukey)"),
     ("anova2", "ANOVA à deux facteurs"),
+    ("anovan", "ANOVA à 3 facteurs ou plus"),
     ("rr", "R&R : croisée, emboîtée, type 1"),
     ("capa", "Capabilité (Pp/Ppk, Cp/Cpk)"),
     ("kappa", "Kappa de Cohen"),
@@ -77,7 +78,8 @@ COMMANDES_MENU = [
     ("alpha", "Risque α des tests"),
     ("lecture", "Options de lecture (séparateur, décimale)"),
     ("export", "Récupérer les données en CSV"),
-    ("effacer", "Effacer les données"),
+    ("supprimer", "Supprimer une ou plusieurs séries"),
+    ("effacer", "Effacer toutes les données"),
     ("annuler", "Annuler la saisie en attente"),
     ("aide", "Aide"),
 ]
@@ -95,7 +97,8 @@ BTN_MENU = [[("📈 Descriptif", "/descriptif"), ("🔔 Normalité", "/normalite
             [("📉 Régression", "/regression"), ("⏳ Série chrono.", "/serie")],
             [("📊 Graphiques", "/graphique"), ("📏 Cartes", "/carte")],
             [("🎲 Générer", "/generer"), ("🖼 Illustrations", "/illustration")],
-            [("📤 Export CSV", "/export"), ("📋 Données", "/etat")]]
+            [("📤 Export CSV", "/export"), ("📋 Données", "/etat")],
+            [("🗑 Supprimer une série", "/supprimer")]]
 
 
 # =============================================================================
@@ -321,9 +324,9 @@ class Session:
         if cmd not in ("/annuler",):
             self.attente = None if cmd != "/lecture" else self.attente
         table = {"/start": self.c_start, "/aide": self.c_aide, "/help": self.c_aide, "/donnees": self.c_donnees,
-                 "/etat": self.c_etat, "/effacer": self.c_effacer, "/annuler": self.c_annuler, "/export": self.c_export,
+                 "/etat": self.c_etat, "/effacer": self.c_effacer, "/supprimer": self.c_supprimer, "/annuler": self.c_annuler, "/export": self.c_export,
                  "/lecture": self.c_lecture, "/descriptif": self.c_descriptif, "/normalite": self.c_normalite,
-                 "/t": self.c_t, "/anova": self.c_anova, "/anova2": self.c_anova2, "/rr": self.c_rr, "/capa": self.c_capa, "/kappa": self.c_kappa,
+                 "/t": self.c_t, "/anova": self.c_anova, "/anova2": self.c_anova2, "/anovan": self.c_anovan, "/rr": self.c_rr, "/capa": self.c_capa, "/kappa": self.c_kappa,
                  "/f": self.c_f, "/z": self.c_z, "/poisson": self.c_poisson, "/puissance": self.c_puissance, "/estimation": self.c_estimation,
                  "/identification": self.c_identification, "/correlation": self.c_correlation, "/regression": self.c_regression,
                  "/serie": self.c_serie, "/khi2": self.c_khi2, "/carte": self.c_carte, "/cartep": self.c_cartep,
@@ -361,6 +364,7 @@ class Session:
             "/t [X] [Y|0] [welch|apparie|egales] [sup|inf] [mu=valeur]\n"
             "/anova [colonnes | mesures groupes]\n"
             "/anova2 [mesures facteurA facteurB] [interaction=non]\n"
+            "/anovan mesures facteur1 facteur2 facteur3… [interactions=aucune|2|toutes]   (2 à 6 facteurs)\n"
             "/rr croisee|emboitee [pièces opérateurs mesures] [tol=…] [l=6] [alpha=0,05]   ou   /rr type1 mesures ref=… tol=… [k=20] [l=6]\n"
             "/capa [colonne] [LSL] [USL] [cible] [σ intra]  (« - » pour une valeur absente)\n"
             "/kappa [évaluation 1] [évaluation 2]\n"
@@ -382,7 +386,8 @@ class Session:
             "/illustration [sujet]   ·   /alpha [valeur]\n"
             "/vocabulaire [mot]   (définition d'un terme ; sans argument : la liste)\n"
             "Les colonnes se désignent par leur numéro (voir /etat) ou leur nom.\n\n"
-            "Autres\n/etat · /export · /effacer · /annuler\n\n"
+            "Autres\n/etat · /export · /supprimer [colonnes] · /effacer · /annuler\n"
+            "• /supprimer retire une ou plusieurs séries (colonnes) des données chargées ; sans argument, des boutons proposent chaque colonne.\n\n"
             "Les données ne sont conservées qu'en mémoire du bot, le temps de la conversation.", BTN_MENU)]
 
     def c_donnees(self, args, a_liberer):
@@ -406,6 +411,29 @@ class Session:
         self.liberer_fichier()
         self.brut = None
         return [msg("🗑 Données effacées.")]
+
+    def c_supprimer(self, args, a_liberer):
+        d = self.donnees()
+        libres, _ = self._kv(args)
+        if libres and libres[0].lower() in ("tout", "toutes"):
+            return self.c_effacer([], a_liberer)
+        if not libres:
+            boutons, _ = self.boutons_colonnes("/supprimer", "tout")
+            boutons.append([("🗑 Tout effacer", "/effacer"), ("✅ Terminé", "/etat")])
+            return [msg("Quelle série supprimer ?\n" + self.liste_colonnes() + "\n(ou /supprimer 2 3 · /supprimer nom)", boutons, remplace=True)]
+        noms = []
+        for ref in libres:
+            n = self.colonne(ref, "tout")
+            if n not in noms:
+                noms.append(n)
+        d.supprimer_colonnes(noms)
+        self.brut = None                          # /lecture ne doit pas ressusciter les séries supprimées
+        if not d.noms:
+            return self.c_effacer([], a_liberer)
+        self._verifier_groupe()
+        boutons, _ = self.boutons_colonnes("/supprimer", "tout")
+        boutons.append([("🗑 Tout effacer", "/effacer"), ("✅ Terminé", "/etat")])
+        return [msg(f"🗑 Supprimé : {', '.join(noms)}.\n\n{d.resume()}\n\n{self.liste_colonnes()}\n\nAutre série à supprimer ?", boutons, remplace=True)]
 
     def c_annuler(self, args, a_liberer):
         self.attente = None
@@ -532,6 +560,17 @@ class Session:
             return self._choisir_col(f"{pref} {self.index(y)} {self.index(a)}", f"Facteur A : {a}. Facteur B ?", "tout", exclure=(y, a))
         b = self.colonne(libres[2], "tout")
         return self._res(self.etude.commande("anova2", {"valeur": y, "facteur_a": a, "facteur_b": b, "interaction": not suffixe}), a_liberer)
+
+    def c_anovan(self, args, a_liberer):
+        self.donnees()
+        libres, kv = self._kv(args)
+        if len(libres) < 3:
+            return self._suite("/anovan", "ANOVA multi-facteurs : envoyez la colonne des mesures puis 2 à 6 colonnes de facteurs, "
+                                          "par numéro ou par nom [interactions=aucune|2|toutes].\nExemple : 1 2 3 4")
+        y = self.colonne(libres[0])
+        fac = [self.colonne(x, "tout") for x in libres[1:]]
+        inter = kv.get("interactions", "2").lower()
+        return self._res(self.etude.commande("anovan", {"valeur": y, "facteurs": fac, "interactions": inter}), a_liberer)
 
     def c_rr(self, args, a_liberer):
         self.donnees()
