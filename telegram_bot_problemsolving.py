@@ -105,6 +105,42 @@ def clavier(boutons):
             lignes.append(rang)
     return json.dumps({"inline_keyboard": lignes})
 
+class Attente:
+    """Message « calcul en cours » : affiché seulement si le travail dépasse un court délai,
+    puis supprimé dès que le résultat est prêt (les actions instantanées n'affichent rien)."""
+    def __init__(self, bot, chat_id, delai=2.0, texte="⏳ Calcul en cours…"):
+        self.bot, self.chat_id, self.texte = bot, chat_id, texte
+        self.verrou = threading.Lock()
+        self.msg_id = None
+        self.fini = False
+        self.minuteur = threading.Timer(delai, self._afficher)
+        self.minuteur.daemon = True
+        self.minuteur.start()
+
+    def _afficher(self):
+        with self.verrou:
+            if self.fini:
+                return
+            try:
+                rep = self.bot.api("sendMessage", chat_id=self.chat_id, text=self.texte)
+                if rep.get("ok"):
+                    self.msg_id = rep["result"]["message_id"]
+            except Exception:
+                pass
+
+    def terminer(self):
+        """Annule le minuteur et supprime le message d'attente s'il a été envoyé (appel répétable)."""
+        self.minuteur.cancel()
+        with self.verrou:
+            self.fini = True
+            if self.msg_id:
+                try:
+                    self.bot.api("deleteMessage", chat_id=self.chat_id, message_id=self.msg_id)
+                except Exception:
+                    pass
+                self.msg_id = None
+
+
 class Bot:
     def __init__(self):
         sec = lire_config_telegram()
@@ -118,6 +154,7 @@ class Bot:
         if self.proprio:
             self.autorises.add(self.proprio)
         self.url = f"https://api.telegram.org/bot{self.token}"
+        self.http = requests.Session()                         # connexion réutilisée entre les appels
         self.sessions = {}
         self.verrous = {}
         self.global_lock = threading.Lock()
@@ -128,8 +165,30 @@ class Bot:
         return str(texte).replace(self.token, "***")
 
     def api(self, methode, **params):
-        r = requests.post(f"{self.url}/{methode}", data=params, timeout=70)
-        return r.json()
+        """Appel à l'API Telegram : connexion réutilisée, délais courts, un seul nouvel essai
+        (échec de connexion ou 502/503/504), journal des appels lents (plus de 3 s)."""
+        delai = 70 if methode == "getUpdates" else (5, 30)
+        debut = time.monotonic()
+        for essai in (1, 2):
+            try:
+                r = self.http.post(f"{self.url}/{methode}", data=params, timeout=delai)
+            except requests.exceptions.ConnectTimeout:
+                if essai == 2:
+                    raise
+                time.sleep(1)
+                continue
+            try:
+                rep = r.json()
+            except ValueError:                                 # réponse non JSON (page d'erreur d'une passerelle)
+                rep = {"ok": False, "error_code": r.status_code, "description": f"réponse illisible (HTTP {r.status_code})"}
+            if essai == 1 and methode != "getUpdates" and not rep.get("ok") and rep.get("error_code") in (502, 503, 504):
+                time.sleep(1)
+                continue
+            break
+        duree = time.monotonic() - debut
+        if duree > 3 and methode != "getUpdates":
+            print(f"[API] {methode} : {duree:.1f} s", flush=True)   # visible dans journalctl
+        return rep
 
     def envoyer(self, chat_id, m):
         """Envoie un message (str ou dict avec boutons) ; les boutons vont sur le dernier morceau."""
@@ -182,22 +241,54 @@ class Bot:
             return self.sessions[cle], self.verrous[cle]
 
     # -- exécution d'un travail pour un utilisateur (un seul à la fois par conversation)
-    def _executer(self, chat_id, travail):
+    def _executer(self, chat_id, travail, bouton=None, retirer_clavier=False):
+        """Exécute travail(session, attente). Un message, une photo ou un fichier attend son tour ;
+        un clic de bouton est ignoré si une réponse est déjà en cours de préparation (évite les doublons).
+        bouton : None, ou {"id": identifiant du clic, "message_id": message portant le clavier}.
+        retirer_clavier : retire le clavier du message cliqué dès la prise en compte."""
         session, verrou = self.session(chat_id)
-        with verrou:
-            arret = threading.Event()
+        if bouton is None:
+            verrou.acquire()
+        elif not verrou.acquire(blocking=False):
+            try:
+                self.api("answerCallbackQuery", callback_query_id=bouton["id"],
+                         text="⏳ Une réponse est déjà en cours, merci de patienter.")
+            except Exception:
+                pass
+            return
+        attente = None
+        arret = threading.Event()
+        try:
+            if bouton is not None:
+                try:                                           # accusé de réception immédiat (petit message en haut de l'écran)
+                    self.api("answerCallbackQuery", callback_query_id=bouton["id"], text="⏳ Pris en compte…")
+                except Exception:
+                    pass
+                if retirer_clavier and bouton.get("message_id"):
+                    try:
+                        self.api("editMessageReplyMarkup", chat_id=chat_id, message_id=bouton["message_id"],
+                                 reply_markup=json.dumps({"inline_keyboard": []}))
+                    except Exception:
+                        pass
+            attente = Attente(self, chat_id, texte="⏳ Traitement en cours…")
             threading.Thread(target=self._saisie, args=(chat_id, arret), daemon=True).start()
             try:
-                travail(session)
+                travail(session, attente)
             except Exception as e:
                 try:
+                    attente.terminer()
                     self.envoyer(chat_id, self.masquer(f"⚠️ Erreur interne : {type(e).__name__}: {e}"))
                 except Exception:
                     pass
-            finally:
-                arret.set()
+        finally:
+            arret.set()
+            if attente is not None:
+                attente.terminer()
+            verrou.release()
 
-    def _livrer(self, chat_id, msgs, fichier):
+    def _livrer(self, chat_id, msgs, fichier, attente=None):
+        if attente is not None:
+            attente.terminer()                                 # le message d'attente disparaît avant l'arrivée du résultat
         for m in msgs:
             self.envoyer(chat_id, m)
         if fichier:
@@ -205,7 +296,7 @@ class Bot:
 
     # -- message texte ou photo
     def traiter(self, chat_id, msg):
-        def travail(session):
+        def travail(session, attente):
             fichier_id = None
             if msg.get("photo"):
                 fichier_id = msg["photo"][-1]["file_id"]          # la plus grande définition
@@ -218,10 +309,10 @@ class Bot:
                                           "(jusqu'à quelques minutes)…")
                 donnees = self.telecharger(fichier_id)
                 msgs = session.analyser_image(donnees, (msg.get("caption") or "").strip())
-                self._livrer(chat_id, msgs, None)
+                self._livrer(chat_id, msgs, None, attente)
             elif msg.get("text"):
                 msgs, fichier = session.handle(msg["text"])
-                self._livrer(chat_id, msgs, fichier)
+                self._livrer(chat_id, msgs, fichier, attente)
             elif msg.get("document"):                             # autre fichier : pièce jointe (preuve)
                 doc = msg["document"]
                 if (doc.get("file_size") or 0) > 20 * 1024 * 1024:
@@ -230,31 +321,31 @@ class Bot:
                     donnees = self.telecharger(doc["file_id"])
                     msgs = session.joindre_piece(donnees, doc.get("file_name") or "document",
                                                  (msg.get("caption") or "").strip())
-                    self._livrer(chat_id, msgs, None)
+                    self._livrer(chat_id, msgs, None, attente)
         self._executer(chat_id, travail)
 
     # -- clic sur un bouton : la commande du bouton est exécutée comme si elle était tapée
     def traiter_bouton(self, chat_id, cb):
         data = (cb.get("data") or "").strip()
         message_id = (cb.get("message") or {}).get("message_id")
-        try:
-            self.api("answerCallbackQuery", callback_query_id=cb["id"])
-        except Exception:
-            pass
         if not data.startswith("/"):
+            try:
+                self.api("answerCallbackQuery", callback_query_id=cb["id"])
+            except Exception:
+                pass
             return
 
-        def travail(session):
+        def travail(session, attente):
             msgs, fichier = session.handle(data)
             premier = msgs[0] if msgs else None
             if isinstance(premier, dict) and premier.get("remplace") and message_id:
+                attente.terminer()
                 self.editer(chat_id, message_id, premier)         # menu mis à jour sur place
                 msgs = msgs[1:]
-            elif data.split()[0] in COMMANDES_A_USAGE_UNIQUE and message_id:
-                self.api("editMessageReplyMarkup", chat_id=chat_id, message_id=message_id,
-                         reply_markup=json.dumps({"inline_keyboard": []}))
-            self._livrer(chat_id, msgs, fichier)
-        self._executer(chat_id, travail)
+            self._livrer(chat_id, msgs, fichier, attente)
+        # accusé de réception du clic, refus si une réponse est en cours, clavier retiré pour les commandes à usage unique
+        self._executer(chat_id, travail, bouton={"id": cb["id"], "message_id": message_id},
+                       retirer_clavier=data.split()[0] in COMMANDES_A_USAGE_UNIQUE)
 
     # -- message de démarrage
     def message_demarrage(self):

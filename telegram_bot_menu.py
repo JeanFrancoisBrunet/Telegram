@@ -320,6 +320,14 @@ async def cmd_inconnue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  Callback boutons inline
 # =============================================================================
 
+async def _repondre(query, texte=None):
+    """Répond au clic (petit message en haut de l'écran). Un échec (clic trop ancien, réseau)
+    n'empêche pas l'action demandée."""
+    try:
+        await query.answer(texte)
+    except Exception as exc:
+        log.warning(f"answer : {exc}")
+
 async def callback_bouton(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
@@ -328,9 +336,16 @@ async def callback_bouton(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.answer("⛔ Accès refusé.", show_alert=True)
         return
 
-    await query.answer()
-
     data = query.data
+
+    # Accusé de réception immédiat. Pour un start/stop, un second clic sur un bot dont l'action est
+    # déjà en cours est refusé ici, avec un seul answer() (Telegram n'accepte qu'une réponse par clic).
+    action_clic, _, cle_clic = data.partition(":")
+    if cle_clic in BOTS and _locks[cle_clic].locked():
+        log.info(f"Action ignorée — verrou actif pour '{cle_clic}'")
+        await _repondre(query, "⏳ Action déjà en cours…")
+        return
+    await _repondre(query, {"start": "⏳ Démarrage…", "stop": "⏳ Arrêt…"}.get(action_clic) if cle_clic in BOTS else None)
 
     # --- Rafraîchissement simple ---
     if data == "refresh":
@@ -358,10 +373,9 @@ async def callback_bouton(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     service = info["service"]
     label   = info["label"]
 
-    # --- Verrou anti-double-clic ---
+    # --- Verrou anti-double-clic (sécurité : deux clics presque simultanés ; la réponse au clic est déjà donnée) ---
     if _locks[key].locked():
         log.info(f"Action ignorée — verrou actif pour '{key}'")
-        await query.answer("⏳ Action déjà en cours…", show_alert=False)
         return
 
     async with _locks[key]:
@@ -441,7 +455,10 @@ def main():
             "le bot répond à n'importe quel utilisateur."
         )
 
-    app = ApplicationBuilder().token(token).build()
+    # Délais explicites pour les envois (le polling garde les siens) : une panne de Telegram se voit en 30 s au plus
+    app = (ApplicationBuilder().token(token)
+           .connect_timeout(5).read_timeout(30).write_timeout(30).pool_timeout(10)
+           .build())
 
     app.add_handler(CommandHandler("aide",   cmd_aide))
     app.add_handler(CommandHandler("start",  cmd_menu))   # /start → menu directement
