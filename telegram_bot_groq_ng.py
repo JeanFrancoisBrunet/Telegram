@@ -81,13 +81,17 @@
 import asyncio
 import configparser
 import datetime
+import fcntl
+import json
 import logging
 import os
 import re
 import sys
 import tempfile
 import threading
+import time
 import uuid
+from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
@@ -766,6 +770,50 @@ def _make_agentic_confirm(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, loop):
     return _confirm
 
 # ------------------------------------------------------------
+# Avis 👍/👎 sur les digests de la veille (boutons envoyés par veille.py)
+#   Le bot ne fait qu'enregistrer le vote : une ligne JSON ajoutée à veille_feedback.jsonl.
+#   veille.py la lit à son passage suivant et ajuste ses notes (poids par source et par mot-clé).
+#   Un seul processus doit lire les messages Telegram : c'est pourquoi les boutons sont traités ICI.
+# ------------------------------------------------------------
+VEILLE_DIR      = Path(os.environ.get("VEILLE_DIR", str(Path.home() / "Projects" / "Groq_agent" / "Veille")))
+VEILLE_FEEDBACK = VEILLE_DIR / "veille_feedback.jsonl"
+_RE_VOTE        = re.compile(r"vv:([0-9a-f]{16}):([ud])")
+
+def _veille_vote_record(item_id: str, vote: int) -> bool:
+    """Ajoute le vote (+1 / -1) au fichier d'avis, sous verrou (même schéma que les autres fichiers partagés)."""
+    try:
+        VEILLE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(VEILLE_FEEDBACK, "a", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                f.write(json.dumps({"id": item_id, "v": vote, "ts": time.time()}) + "\n")
+                f.flush()
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+        return True
+    except Exception as exc:
+        logger.error(f"_veille_vote_record : {exc}", exc_info=True)
+        return False
+
+def _veille_clavier_marque(markup, item_id: str, sens: str):
+    """Reconstruit le clavier en cochant (✓) le bouton choisi pour cet article ; les autres lignes sont inchangées.
+    Le vote reste modifiable : l'autre bouton de la ligne fonctionne toujours."""
+    rows = []
+    for row in markup.inline_keyboard:
+        new_row = []
+        for b in row:
+            m = _RE_VOTE.fullmatch(b.callback_data or "")
+            if m and m.group(1) == item_id:
+                label = b.text.replace(" ✓", "")
+                if m.group(2) == sens:
+                    label += " ✓"
+                new_row.append(InlineKeyboardButton(label, callback_data=b.callback_data))
+            else:
+                new_row.append(b)
+        rows.append(new_row)
+    return InlineKeyboardMarkup(rows)
+
+# ------------------------------------------------------------
 # Callback boutons inline (/model, /resume, /temp, /load, confirmations)
 # ------------------------------------------------------------
 async def callback_dispatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -777,6 +825,22 @@ async def callback_dispatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
     data = query.data
+
+    if data.startswith("vv:"):
+        m = _RE_VOTE.fullmatch(data)
+        if not m:
+            logger.warning(f"callback_dispatch : avis invalide : '{data}'")
+            return
+        item_id, sens = m.group(1), m.group(2)
+        if not _veille_vote_record(item_id, 1 if sens == "u" else -1):
+            await _reply(query, "⚠ Avis non enregistré (voir les logs du bot).")
+            return
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=_veille_clavier_marque(query.message.reply_markup, item_id, sens))
+        except Exception as exc:        # y compris « message is not modified » (même bouton touché deux fois)
+            logger.info(f"avis veille : clavier non mis à jour ({_safe_exc_text(exc)})")
+        return
 
     if data.startswith("groq_model:"):
         n = data[len("groq_model:"):]
