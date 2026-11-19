@@ -22,7 +22,7 @@
 #  Dépendance : requests
 #  Lancement  : python3 telegram_bot_problemsolving.py
 #  Service    : voir la fiche « Bot Telegram » (systemd, ...)
-#  Auteur : Jean-François BRUNET – JFBConseils – Octobre 2026
+#  Auteur : Jean-François BRUNET – JFBConseils – Novembre 2026
 #  Rev.   : 
 # =============================================================================
 
@@ -55,9 +55,13 @@ COMMANDES_MENU = [
     ("sauter", "Sauter la question en cours"),
     ("prec", "Question précédente"),
     ("reponse", "Relire mes réponses de l'étape"),
-    ("modele", "Moteur, modèles IA et mode (boutons)"),
+    ("modele", "Moteur, modèles IA et mode (cocher, ouvrir, supprimer)"),
     ("mode", "Mode : guidé, rapide ou libre"),
-    ("projets", "Mes projets : ré-ouvrir, supprimer"),
+    ("projets", "Mes projets : ré-ouvrir, supprimer (cocher, ouvrir, supprimer)"),
+    ("supprimer", "Supprimer des projets (liste à cocher)"),
+    ("restaurer", "Restaurer une étape effacée"),
+    ("modifier", "Modifier une réponse"),
+    ("doc", "Joindre un document comme preuve"),
     ("sauver", "Enregistrer le projet (+ titre)"),
     ("titre", "Définir ou modifier le titre"),
     ("historique", "Relire les échanges de l'étape"),
@@ -70,7 +74,7 @@ COMMANDES_MENU = [
 
 # Boutons qui modifient l'état : le clavier du message est retiré après le clic (pas de double clic)
 COMMANDES_A_USAGE_UNIQUE = {"/ok", "/passer", "/retour", "/stop", "/nouveau", "/charger",
-                            "/supprimer", "/8d", "/a3", "/pdca", "/k6pts", "/sauter", "/prec"}
+                            "/8d", "/a3", "/pdca", "/k6pts", "/sauter", "/prec"}
 
 def lire_config_telegram():
     cp = configparser.RawConfigParser()
@@ -357,7 +361,7 @@ class Bot:
                  f"📅 {datetime.now():%d/%m/%Y %H:%M:%S}{ntp_avert}\n\n"
                  f"📡 Moteur : {b}\n"
                  f"🧠 Texte : {session.modele('texte')}\n"
-                 f"📷 Photos : {session.modele('vision')}\n"
+                 f"📷 Vision : {session.modele('vision')}\n"
                  f"🧭 Mode : {session.mode}\n")
         if session.methode:
             avance = ("terminé" if session.fini else f"étape {session.idx + 1}/{len(session.etapes)}")
