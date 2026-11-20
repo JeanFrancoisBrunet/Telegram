@@ -18,7 +18,7 @@
 #    /retry             – Relance ton dernier message (après une erreur ou pour
 #                         une autre réponse ; propre à ce bot, mémorisé en RAM)
 #    /mem               – Affiche la mémoire longue (faits mémorisés)
-#    /skills            – Liste les skills disponibles
+#    /skills            – Liste les skills disponibles (paginée, boutons ◀ ▶)
 #    /load              – Choisir un skill à afficher (boutons)
 #    /load <nom ou n°>  – Affiche un skill – à taper en entier
 #    /reflect           – Basculer le mode Self-Reflection (On/Off)
@@ -206,6 +206,49 @@ def _trunc(text: str, maxlen: int = 4000) -> str:
     """Telegram limite les messages à 4096 caractères."""
     return text if len(text) <= maxlen else text[:maxlen - 3] + "…"
 
+_MSG_LIMIT = 3900        # Telegram : 4096 caractères par message ; marge pour le balisage et les marqueurs
+_MSG_MAX_TOTAL = 12000   # au-delà (≈ 4 messages), le reste est signalé comme non affiché : évite d'inonder le chat
+
+def _split_message(text: str, limit: int = _MSG_LIMIT, total: int = _MSG_MAX_TOTAL) -> list:
+    """Découpe un long texte en messages ≤ `limit` caractères, aux fins de ligne (et de paragraphe de préférence).
+    - un bloc de code ``` coupé en deux est refermé puis rouvert pour que chaque message reste un Markdown valide ;
+    - une ligne démesurée est coupée en dernier recours ;
+    - les messages suivants portent « (suite i/n) » ;
+    - au-delà de `total` caractères, la fin est remplacée par une note."""
+    text = text or ""
+    if len(text) <= limit:
+        return [text]
+    note = ""
+    if len(text) > total:
+        note = f"\n\n… ({len(text) - total} caractères non affichés)"
+        text = text[:total]
+    budget = limit - 80
+    chunks, cur, size, fence = [], [], 0, False
+
+    def flush():
+        nonlocal cur, size
+        body = "\n".join(cur)
+        chunks.append(body + ("\n```" if fence else ""))
+        cur, size = [], 0
+
+    for line in text.split("\n"):
+        pieces = [line[k:k + budget] for k in range(0, len(line), budget)] or [""]
+        for n, piece in enumerate(pieces):
+            if cur and (size + len(piece) + 1 > budget or (piece == "" and size > budget * 0.6)):
+                flush()
+                if fence:
+                    cur, size = ["```"], 4
+            cur.append(piece)
+            size += len(piece) + 1
+            if n == 0 and piece.lstrip().startswith("```"):
+                fence = not fence
+    if cur:
+        flush()
+    n = len(chunks)
+    chunks = [(f"_(suite {i + 1}/{n})_\n" if i else "") + c for i, c in enumerate(chunks)]
+    chunks[-1] += note
+    return chunks
+
 # « /tool » suivi d'au moins un argument, jusqu'à la fin de ligne, d'une
 # parenthèse, d'un backtick ou d'un tiret séparateur (« — »).
 _RE_EXEMPLE_TOOL = re.compile(r"/tool\s+[^\s`(][^\n`(]*?(?=\s*(?:[()]|\n|$|\s[—–-]\s))")
@@ -254,33 +297,41 @@ async def _reply(update: Update, text: str, reply_markup=None):
     Markdown valide dans les menus (backticks fermés, sur une seule ligne).
 
     `update` peut aussi être un CallbackQuery (il possède .message)."""
-    try:
-        await update.message.reply_text(
-            _trunc(text), parse_mode="Markdown", reply_markup=reply_markup
-        )
-    except Exception:
-        await update.message.reply_text(_trunc(text), reply_markup=reply_markup)
+    chunks = _split_message(text)
+    for k, ch in enumerate(chunks):
+        mk = reply_markup if k == len(chunks) - 1 else None      # les boutons suivent le DERNIER message
+        try:
+            await update.message.reply_text(ch, parse_mode="Markdown", reply_markup=mk)
+        except Exception:
+            await update.message.reply_text(ch, reply_markup=mk)
 
 async def _safe_edit(query, text: str, reply_markup=None):
     """Équivalent de _reply() pour l'édition de message (boutons inline).
-    Repli en texte brut si le Markdown est mal formé."""
+    Repli en texte brut si le Markdown est mal formé. Un texte long remplace le message par sa 1re partie ;
+    les suivantes sont envoyées en messages à la suite."""
+    chunks = _split_message(text)
+    mk0 = reply_markup if len(chunks) == 1 else None
     try:
-        await query.edit_message_text(
-            _trunc(text), parse_mode="Markdown", reply_markup=reply_markup
-        )
+        await query.edit_message_text(chunks[0], parse_mode="Markdown", reply_markup=mk0)
     except Exception:
-        await query.edit_message_text(_trunc(text), reply_markup=reply_markup)
+        await query.edit_message_text(chunks[0], reply_markup=mk0)
+    for k, ch in enumerate(chunks[1:], 1):
+        mk = reply_markup if k == len(chunks) - 1 else None
+        try:
+            await query.message.reply_text(ch, parse_mode="Markdown", reply_markup=mk)
+        except Exception:
+            await query.message.reply_text(ch, reply_markup=mk)
 
 async def _safe_send(bot, chat_id, text: str, reply_markup=None):
     """Équivalent de _reply() pour un envoi direct via bot.send_message
     (hors contexte d'un update, ex. message de démarrage)."""
-    try:
-        await bot.send_message(
-            chat_id=chat_id, text=_trunc(text), parse_mode="Markdown",
-            reply_markup=reply_markup,
-        )
-    except Exception:
-        await bot.send_message(chat_id=chat_id, text=_trunc(text), reply_markup=reply_markup)
+    chunks = _split_message(text)
+    for k, ch in enumerate(chunks):
+        mk = reply_markup if k == len(chunks) - 1 else None
+        try:
+            await bot.send_message(chat_id=chat_id, text=ch, parse_mode="Markdown", reply_markup=mk)
+        except Exception:
+            await bot.send_message(chat_id=chat_id, text=ch, reply_markup=mk)
 
 def _clean_reflect_response(original: str, reflected: str) -> str:
     """Nettoie la sortie de reflect_on_response pour le mode Telegram mobile.
@@ -618,6 +669,64 @@ async def cmd_compact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _reply(update, "\n".join(lignes))
 
 # ------------------------------------------------------------
+# Pagination des listes (skills) : Telegram limite un message à 4096 caractères
+# ------------------------------------------------------------
+_PAGE_CHARS = 3300      # marge sous 4096 (titre, pied, balisage Markdown)
+_PAGE_BTNS_PAR_LIGNE = 6
+_LOAD_PAR_PAGE = 10
+
+def _skills_pages(sorted_index: list) -> list:
+    """Découpe la liste en pages de taille raisonnable : (numéro, bloc de texte) par skill.
+    Le découpage se fait au CARACTÈRE (et non à effectif fixe) : les descriptions varient beaucoup."""
+    pages, cur, taille = [], [], 0
+    for i, s in enumerate(sorted_index, 1):
+        desc = str(s.get("description", ""))
+        desc = desc if len(desc) <= 400 else desc[:397] + "…"
+        triggers = ", ".join(s.get("triggers", [])[:3])
+        bloc = f"*{i}.* `{s['name']}` — {desc}\n   ↳ Triggers : _{triggers}_"
+        if cur and taille + len(bloc) + 1 > _PAGE_CHARS:
+            pages.append(cur)
+            cur, taille = [], 0
+        cur.append((i, bloc))
+        taille += len(bloc) + 1
+    if cur:
+        pages.append(cur)
+    return pages
+
+def _nav_row(prefixe: str, page: int, total: int) -> list:
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Précédent", callback_data=f"{prefixe}:{page - 1}"))
+    if page < total - 1:
+        nav.append(InlineKeyboardButton("Suivant ▶", callback_data=f"{prefixe}:{page + 1}"))
+    return nav
+
+def _skills_page_view(sorted_index: list, page: int):
+    """(texte, clavier) d'une page de /skills. Les boutons numérotés affichent le skill (même numérotation que /load)."""
+    pages = _skills_pages(sorted_index)
+    n = len(pages)
+    page = max(0, min(page, n - 1))
+    entete = f"📚 *Skills disponibles* — {len(sorted_index)} au total" + (f" · page {page + 1}/{n}" if n > 1 else "")
+    texte = entete + "\n\n" + "\n".join(b for _, b in pages[page]) + "\n\nTouchez un numéro pour afficher le skill."
+    nums = [InlineKeyboardButton(str(i), callback_data=f"load:{i}") for i, _ in pages[page]]
+    rows = [nums[k:k + _PAGE_BTNS_PAR_LIGNE] for k in range(0, len(nums), _PAGE_BTNS_PAR_LIGNE)]
+    if n > 1:
+        rows.append(_nav_row("sk", page, n))
+    return texte, InlineKeyboardMarkup(rows)
+
+def _load_menu_view(sorted_index: list, page: int):
+    """(texte, clavier) d'une page du menu /load (un bouton par skill, _LOAD_PAR_PAGE par page)."""
+    n = max(1, -(-len(sorted_index) // _LOAD_PAR_PAGE))
+    page = max(0, min(page, n - 1))
+    debut = page * _LOAD_PAR_PAGE
+    rows = [[InlineKeyboardButton(f"{i}. {s['name']}", callback_data=f"load:{i}")]
+            for i, s in enumerate(sorted_index[debut:debut + _LOAD_PAR_PAGE], debut + 1)]
+    if n > 1:
+        rows.append(_nav_row("ld", page, n))
+    titre = "📚 *Quel skill afficher ?*" + (f"  (page {page + 1}/{n})" if n > 1 else "")
+    return titre, InlineKeyboardMarkup(rows)
+
+# ------------------------------------------------------------
 # /skills
 # ------------------------------------------------------------
 async def cmd_skills(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -637,15 +746,8 @@ async def cmd_skills(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # 'name' du frontmatter -- sans ce tri, la numérotation affichée ici ne
     # correspond pas à celle du terminal, rendant /load <n°> ambigu d'une interface à l'autre.
     sorted_index = sorted(_skills_index, key=lambda s: s["name"].lower())
-
-    lignes = ["📚 *Skills disponibles :*\n"]
-    for i, s in enumerate(sorted_index, 1):
-        triggers = ", ".join(s.get("triggers", [])[:3])
-        lignes.append(f"*{i}.* `{s['name']}` — {s['description']}\n"
-                      f"   ↳ Triggers : _{triggers}_")
-    lignes.append("\n/load pour afficher un skill.")
-
-    await _reply(update, "\n".join(lignes))
+    texte, clavier = _skills_page_view(sorted_index, 0)
+    await _reply(update, texte, reply_markup=clavier)
 
 # ------------------------------------------------------------
 # /load
@@ -656,7 +758,7 @@ async def _afficher_skill(target, nom: str):
     if not content:
         await _reply(target, f"❌ Skill '{nom}' introuvable.")
         return
-    await _reply(target, f"📚 *{nom}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n{_trunc(content, 3800)}")
+    await _reply(target, f"📚 *{nom}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n{content}")
 
 async def cmd_load(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _est_autorise(update):
@@ -672,10 +774,8 @@ async def cmd_load(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not sorted_index:
             await update.message.reply_text("📚 Aucun skill disponible.")
             return
-        kb = [[InlineKeyboardButton(f"{i}. {s['name']}", callback_data=f"load:{i}")]
-              for i, s in enumerate(sorted_index, 1)]
-        await _reply(update, "📚 *Quel skill afficher ?*",
-                     reply_markup=InlineKeyboardMarkup(kb))
+        texte, clavier = _load_menu_view(sorted_index, 0)
+        await _reply(update, texte, reply_markup=clavier)
         return
 
     arg = ctx.args[0]
@@ -869,6 +969,23 @@ async def callback_dispatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _safe_edit(query, f"✅ Qualité mise à jour : `{ag.TEMPERATURE}`")
         return
 
+    if data.startswith(("sk:", "ld:")):
+        try:
+            page = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        sorted_index = sorted(ag.load_skills_index(), key=lambda s: s["name"].lower())
+        if not sorted_index:
+            await _safe_edit(query, "📚 Aucun skill disponible.")
+            return
+        vue = _skills_page_view if data.startswith("sk:") else _load_menu_view
+        texte, clavier = vue(sorted_index, page)
+        try:
+            await _safe_edit(query, texte, reply_markup=clavier)
+        except Exception as exc:        # « message is not modified » (même page touchée deux fois)
+            logger.info(f"pagination : message non modifié ({_safe_exc_text(exc)})")
+        return
+
     if data.startswith("load:"):
         try:
             idx = int(data.split(":", 1)[1]) - 1
@@ -910,7 +1027,7 @@ async def callback_dispatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             result = await asyncio.get_running_loop().run_in_executor(
                 None, ag.execute_tool, tool_name, tool_args
             )
-            await _reply(query, _proteger_exemples(_trunc(f"🛠 *Outil : {tool_name}*\n\n{result}")))
+            await _reply(query, _proteger_exemples(f"🛠 *Outil : {tool_name}*\n\n{result}"))
         except Exception as exc:
             logger.error(f"callback_dispatch (tool_confirm) exception : {exc}", exc_info=True)
             await _reply(query, f"❌ Erreur outil `{tool_name}` : {_safe_exc_text(exc)}")
@@ -1380,7 +1497,7 @@ async def cmd_scanmails(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if proc.returncode != 0:
             await _reply(update, f"❌ emails_scan.py a échoué (code {proc.returncode}) :\n{_trunc(sortie, 3500)}")
         else:
-            await _reply(update, _trunc(sortie, 3800) or "✅ Scan terminé, aucune sortie.")
+            await _reply(update, sortie or "✅ Scan terminé, aucune sortie.")
     except Exception as exc:
         await _reply(update, f"❌ Erreur au lancement du scan : {_safe_exc_text(exc)}")
 
