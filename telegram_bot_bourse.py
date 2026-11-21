@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # =============================================================================
 #  Bot Telegram — Suivi Boursier  (@bourse_pi5_bot)
-#  Raspberry Pi 5 - 16Go RAM - 256Go SSD NVMe - Python 3.11+
+#  Raspberry Pi 5 - 16Go RAM - 1 To SSD NVMe - Python 3.11+
 #
 #  Fonctions :
 #    - Suivi d'une sélection personnalisée de valeurs (CAC40, S&P500,
@@ -21,6 +21,7 @@
 #      chat_id      = VOTRE_CHAT_ID
 #
 #  Auteur : Jean-François BRUNET – JFBConseils – Juin 2026
+#  Rév : Novembre 2026
 # =============================================================================
 
 import asyncio
@@ -197,7 +198,7 @@ SP500_SYMBOLS = {
 }
 
 NASDAQ100_SYMBOLS = {
-    "ADP": "ADP", "Booking Holdings": "BKNG", "CSX": "CSX",
+    "ADP": "ADP", "Anthropic": "ANT", "Booking Holdings": "BKNG", "CSX": "CSX",
     "Gilead Sciences": "GILD", "Intuit": "INTU",
     "Intuitive Surgical": "ISRG", "Keurig Dr Pepper": "KDP",
     "Mondelez": "MDLZ", "Regeneron": "REGN", "Vertex Pharma": "VRTX",
